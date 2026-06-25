@@ -960,7 +960,7 @@ static int readrnxobsb(FILE *fp, const char *opt, double ver, int *tsys,
 {
     gtime_t time={0};
     sigind_t index[7]={{0}};
-    char buff[MAXRNXLEN];
+    char buff[MAXRNXLEN],satid[8]="";
     int i=0,n=0,nsat=0,sats[MAXOBS]={0},mask;
     
     /* set system mask */
@@ -992,9 +992,22 @@ static int readrnxobsb(FILE *fp, const char *opt, double ver, int *tsys,
             
             data[n].time=time;
             data[n].sat=(unsigned char)sats[i-1];
+            if (ver>2.99) {
+                strncpy(satid,buff,3);
+                satid[3]='\0';
+            }
+            else {
+                satno2id(data[n].sat,satid);
+            }
             
             /* decode obs data */
-            if (decode_obsdata(fp,buff,ver,mask,index,data+n)&&n<MAXOBS) n++;
+            {
+                int ok=decode_obsdata(fp,buff,ver,mask,index,data+n);
+                if (time.time==gpst2time(2143,381459.0).time&&fabs(time.sec-gpst2time(2143,381459.0).sec)<1E-6) {
+                    rtk_debug_rawline("rinex_obs",time,satid,sats[i-1],data[n].sat,ok);
+                }
+                if (ok&&n<MAXOBS) n++;
+            }
         }
         else if (*flag==3||*flag==4) { /* new site or header info follows */
             

@@ -86,9 +86,10 @@ int main(int argc,char *argv)
 	double tint=1.0; //采样间隔记得改 
 	int n=3; //输入文件数
     char basepath[] = "F:\\RTKLib-LAB\\data";
+    char resultpath[] = "F:\\RTKLib-LAB\\result";
 
     //////////////////////////////////////////////////////注意更改文件夹
-    char str_envir[] = "\\Open\\";
+    char str_envir[] = "\\Wall\\";
 
     char* str[5];
     for (int i = 0; i < 5; i++) {
@@ -99,8 +100,11 @@ int main(int argc,char *argv)
 
     //记得改文件名尤其是24/25O
     char* infile[3] = { {strcat(str[0],"rover.21O")},{strcat(str[1],"rover.21P")}};
-    char outfile[] = "F:\\RTKLib-LAB\\result\\Open\\test.pos";
+    char outfile[256] = "";
     infile[2] = strcat(str[3],"base.21O");
+    strcpy(outfile, resultpath);
+    strcat(outfile, str_envir);
+    strcat(outfile, "test.pos");
 
     //openmodel(strcat(str[4], "model_weight.txt"));
 
@@ -137,16 +141,32 @@ int main(int argc,char *argv)
     prcopt.dynamics = 0;
     
 #ifdef ENABLE_RTK_INTEGRITY
+    /* Integrity master switches */
     prcopt.enable_rtk_integrity_monitor = 1;
     prcopt.enable_rtk_integrity_rbias_export = 0;
+
+    /* Monitored fault modes */
     prcopt.enable_monitor_single_satellite_fault = 1;
     prcopt.enable_monitor_fixed_ambiguity_update_fault = 1;
-    prcopt.enable_rtk_integrity_fde_recovery = 0;
-    prcopt.rtk_integrity_max_subset_filters = 12;
-    prcopt.enable_rtk_integrity_subset_debug_output = 1;
+
+    /* Recovery / subset control */
+    prcopt.enable_rtk_integrity_fde_recovery = 1;
+    prcopt.rtk_integrity_max_subset_filters = 32;
+
+    /* Integrity debug output */
+    prcopt.enable_rtk_integrity_subset_debug_output = 0;
     prcopt.rtk_integrity_debug_subset_id = 0;
     prcopt.rtk_integrity_debug_satellite = 0;
     prcopt.rtk_integrity_debug_pl_threshold = 0.0;
+#endif
+#if ENABLE_RTK_SKIP_EPOCH
+    prcopt.rtk_skip_epoch_time[0] = 2021;
+    prcopt.rtk_skip_epoch_time[1] = 2;
+    prcopt.rtk_skip_epoch_time[2] = 4;
+    prcopt.rtk_skip_epoch_time[3] = 9;
+    prcopt.rtk_skip_epoch_time[4] = 57;
+    prcopt.rtk_skip_epoch_time[5] = 39;
+    prcopt.rtk_skip_epoch_satellite = 30; /* G30 */
 #endif
 
 	/* Position */
@@ -187,7 +207,7 @@ int main(int argc,char *argv)
 
     
 	/* Output */
-	solopt.timef= 0;
+	solopt.timef= 1;
 	solopt.posf = SOLF_XYZ;
 	solopt.sstat = 0;
 	solopt.trace = 0;

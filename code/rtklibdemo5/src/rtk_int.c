@@ -1,4 +1,4 @@
-#include "rtklib.h"
+﻿#include "rtklib.h"
 
 #ifdef ENABLE_RTK_INTEGRITY
 
@@ -16,7 +16,21 @@
 #define IB_(s,f,opt) (NR_(opt)+MAXSAT*(f)+(s)-1)
 
 static FILE *fp_pint=NULL,*fp_pld=NULL,*fp_sub=NULL,*fp_rbias=NULL;
+#if ENABLE_RTK_DEBUG_OUTPUT
+static FILE *fp_rtk_dbg=NULL;
+#endif
 static int out_sub=0,out_rbias=0;
+static char rbias_path_hint[1024]="";
+
+#if ENABLE_RTK_ARAIM_PL_BIAS_TERM
+typedef struct {
+    int sysidx,band,meas,sat;
+    double mu,sigma,bound;
+    int count;
+} rbiasp_t;
+static rbiasp_t *rbiasp=NULL;
+static int nrbiasp=0,rbias_loaded=0,rbias_try=0;
+#endif
 
 static void sigenu(const double *rr, const double *qr, double *sig)
 {
@@ -46,6 +60,212 @@ static void setpath(char *dst, const char *src, const char *ext)
     if ((p=strrchr(dst,'.'))) *p='\0';
     strcat(dst,ext);
 }
+
+static void setbasename(char *dst, const char *src, const char *name)
+{
+    char *p;
+    strcpy(dst,src);
+    if ((p=strrchr(dst,'\\'))) *(p+1)='\0';
+    else if ((p=strrchr(dst,'/'))) *(p+1)='\0';
+    else dst[0]='\0';
+    strcat(dst,name);
+}
+
+static int sysidx(int sys)
+{
+    if (sys==SYS_GPS) return 0;
+    if (sys==SYS_GLO) return 1;
+    if (sys==SYS_GAL) return 2;
+    if (sys==SYS_CMP) return 3;
+    if (sys==SYS_QZS) return 4;
+    return -1;
+}
+
+static const char *systxt(int sys)
+{
+    if (sys==SYS_GPS) return "G";
+    if (sys==SYS_GLO) return "R";
+    if (sys==SYS_GAL) return "E";
+    if (sys==SYS_CMP) return "C";
+    if (sys==SYS_QZS) return "J";
+    return "?";
+}
+
+#if ENABLE_RTK_ARAIM_PL_BIAS_TERM
+static int satfromid(const char *id)
+{
+    int sat=satid2no(id);
+    if (sat>0) return sat;
+    return atoi(id);
+}
+
+static int measidx(const char *s)
+{
+    if (!strcmp(s,"CODE")||!strcmp(s,"code")||!strcmp(s,"P")) return 1;
+    if (!strcmp(s,"PHASE")||!strcmp(s,"phase")||!strcmp(s,"L")) return 0;
+    return -1;
+}
+
+static int splitcsv(char *line, char **cols, int maxcols)
+{
+    int n=0;
+    char *p=line;
+    while (n<maxcols) {
+        cols[n++]=p;
+        if (!(p=strchr(p,','))) break;
+        *p++='\0';
+    }
+    return n;
+}
+
+static int loadrbiasfile(const char *path)
+{
+    FILE *fp=fopen(path,"r");
+    char buff[1024],*cols[16];
+    rbiasp_t *tmp=NULL;
+    int n=0,cap=0;
+    if (!fp) return 0;
+    while (fgets(buff,sizeof(buff),fp)) {
+        rbiasp_t p={0};
+        int nc;
+        char *q=strchr(buff,'\n');
+        if (q) *q='\0';
+        nc=splitcsv(buff,cols,16);
+        if (nc<9||!strcmp(cols[0],"sysidx")) continue;
+        p.sysidx=atoi(cols[0]);
+        p.band=atoi(cols[2]);
+        p.meas=measidx(cols[3]);
+        p.sat=satfromid(cols[4]);
+        p.mu=atof(cols[5]);
+        p.sigma=atof(cols[6]);
+        p.bound=atof(cols[7]);
+        p.count=atoi(cols[8]);
+        if (p.sysidx<0||p.band<=0||p.meas<0||p.sat<=0) continue;
+        if (n>=cap) {
+            cap=cap<=0?128:cap*2;
+            tmp=(rbiasp_t *)realloc(tmp,sizeof(rbiasp_t)*cap);
+            if (!tmp) {
+                fclose(fp);
+                return 0;
+            }
+        }
+        tmp[n++]=p;
+    }
+    fclose(fp);
+    if (n<=0) {
+        free(tmp);
+        return 0;
+    }
+    free(rbiasp);
+    rbiasp=tmp;
+    nrbiasp=n;
+    return 1;
+}
+
+static int ensurerbias(void)
+{
+    const char *paths[]={
+        rbias_path_hint,
+        "result\\Open\\rbias_params.csv",
+        "results\\bias_envelope\\output\\rbias_params.csv",
+        "result\\bias_envelope\\output\\rbias_params.csv",
+        "..\\result\\Open\\rbias_params.csv",
+        "..\\results\\bias_envelope\\output\\rbias_params.csv",
+        "..\\result\\bias_envelope\\output\\rbias_params.csv",
+        "..\\..\\result\\Open\\rbias_params.csv",
+        "..\\..\\results\\bias_envelope\\output\\rbias_params.csv",
+        "..\\..\\result\\bias_envelope\\output\\rbias_params.csv",
+        "bias_envelope\\output\\rbias_params.csv"
+    };
+    int i;
+    if (rbias_loaded) return 1;
+    if (rbias_try) return 0;
+    rbias_try=1;
+    for (i=0;i<(int)(sizeof(paths)/sizeof(paths[0]));i++) {
+        if (!paths[i]||!paths[i][0]) continue;
+        if (loadrbiasfile(paths[i])) {
+            rbias_loaded=1;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int findrbias(int sysi, int band, int meas, int sat)
+{
+    int i;
+    for (i=0;i<nrbiasp;i++) {
+        if (rbiasp[i].sysidx==sysi&&rbiasp[i].band==band&&
+            rbiasp[i].meas==meas&&rbiasp[i].sat==sat) return i;
+    }
+    return -1;
+}
+
+static int calcbiasenu(rtk_t *rtk, double *be, double *bn, double *bu, int *rows)
+{
+    rtkint_t *mon=&rtk->intg;
+    double pos[3],E[9],dxyz[3]={0},denu[3],*mu,*R,*W,*tmp,*dx;
+    int i,j,k,n=0,nx=rtk->nx,sys,su,sf,frq,meas,idxu,idxf,sysi;
+    int sel[RTKINT_MAX_BIAS_ROWS];
+    *be=*bn=*bu=0.0;
+    if (rows) *rows=0;
+    if (!ensurerbias()||mon->bnv<=0||mon->bnx!=nx||!mon->bH||!mon->bR) return 0;
+    for (i=0;i<mon->bnv&&n<RTKINT_MAX_BIAS_ROWS;i++) {
+        sf=(mon->bflg[i]>>16)&0xFF;
+        su=(mon->bflg[i]>>8)&0xFF;
+        meas=(mon->bflg[i]>>4)&0xF;
+        frq=(mon->bflg[i]&0xF)+1;
+        sys=satsys(su,NULL);
+        sysi=sysidx(sys);
+        if (sf<=0||su<=0||sysi<0) continue;
+        idxu=findrbias(sysi,frq,meas,su);
+        idxf=findrbias(sysi,frq,meas,sf);
+        if (idxu<0||idxf<0) continue;
+        sel[n++]=i;
+    }
+    if (n<=0) return 0;
+    mu=mat(n,1); R=mat(n,n); W=mat(n,n); tmp=mat(nx,1); dx=mat(nx,1);
+    if (!mu||!R||!W||!tmp||!dx) {
+        free(mu); free(R); free(W); free(tmp); free(dx);
+        return 0;
+    }
+    for (i=0;i<n;i++) {
+        int ri=sel[i];
+        sf=(mon->bflg[ri]>>16)&0xFF;
+        su=(mon->bflg[ri]>>8)&0xFF;
+        meas=(mon->bflg[ri]>>4)&0xF;
+        frq=(mon->bflg[ri]&0xF)+1;
+        sysi=sysidx(satsys(su,NULL));
+        idxu=findrbias(sysi,frq,meas,su);
+        idxf=findrbias(sysi,frq,meas,sf);
+        mu[i]=rbiasp[idxu].mu-rbiasp[idxf].mu;
+        for (j=0;j<n;j++) R[i+j*n]=mon->bR[ri+sel[j]*mon->bnv];
+    }
+    matcpy(W,R,n,n);
+    if (matinv(W,n)) {
+        free(mu); free(R); free(W); free(tmp); free(dx);
+        return 0;
+    }
+    for (k=0;k<nx;k++) {
+        double s=0.0;
+        for (i=0;i<n;i++) for (j=0;j<n;j++) {
+            s+=mon->bH[k+sel[i]*nx]*W[i+j*n]*mu[j];
+        }
+        tmp[k]=s;
+    }
+    matmul("NN",nx,1,nx,1.0,rtk->P,tmp,0.0,dx);
+    dxyz[0]=dx[0]; dxyz[1]=dx[1]; dxyz[2]=dx[2];
+    ecef2pos(rtk->sol.rr,pos);
+    xyz2enu(pos,E);
+    matmul("NN",3,1,3,1.0,E,dxyz,0.0,denu);
+    *be=fabs(denu[0]);
+    *bn=fabs(denu[1]);
+    *bu=fabs(denu[2]);
+    if (rows) *rows=n;
+    free(mu); free(R); free(W); free(tmp); free(dx);
+    return 1;
+}
+#endif
 
 static int hasobs(const obsd_t *obs, int n, int rcv, int sat)
 {
@@ -238,9 +458,16 @@ static void calcpl(rtk_t *rtk)
     rtkint_t *mon=&rtk->intg;
     rtkint_pl_t *pl=&mon->pl;
     double msig[3],pe,pn,pu,ssig[3],sss,subp,qmain[6];
+    double be=0.0,bn=0.0,bu=0.0;
+    int brows=0;
     int i,k;
 
     memset(pl,0,sizeof(*pl));
+    if (rtk->sol.stat==SOLQ_NONE) {
+        rtk->int_hpl=0.0;
+        rtk->int_vpl=0.0;
+        return;
+    }
     for (i=0;i<6;i++) qmain[i]=rtk->sol.qr[i];
     sigenu(rtk->sol.rr,qmain,msig);
     for (i=0;i<3;i++) pl->msig[i]=msig[i];
@@ -274,8 +501,17 @@ static void calcpl(rtk_t *rtk)
     pl->pe=pe; pl->pn=pn; pl->pu=pu;
     pl->hpl0=SQRT_(SQR_(pe)+SQR_(pn));
     pl->vpl0=pu;
-    pl->hpl=pl->hpl0;
-    pl->vpl=pl->vpl0;
+#if ENABLE_RTK_ARAIM_PL_BIAS_TERM
+    if (calcbiasenu(rtk,&be,&bn,&bu,&brows)) {
+        pl->bias_loaded=1;
+        pl->bias_rows=brows;
+        pl->be=be; pl->bn=bn; pl->bu=bu;
+    }
+#endif
+    pl->hpl=SQRT_(SQR_(pe+pl->be)+SQR_(pn+pl->bn));
+    pl->vpl=pu+pl->bu;
+    pl->hadd=pl->hpl-pl->hpl0;
+    pl->vadd=pl->vpl-pl->vpl0;
     rtk->int_hpl=pl->hpl;
     rtk->int_vpl=pl->vpl;
 }
@@ -304,6 +540,11 @@ static void evalfde(rtk_t *rtk)
             double sc=th>0.0?st/th:0.0;
             if (sc>score) score=sc;
         }
+        trace(3,
+              "fde score: subset=%d mode=%d sat=%d qi=%d ratio=%.3f "
+              "sep=%.4f %.4f %.4f score=%.4f\n",
+              def->id,def->mode,def->sat,ss->qi,ss->ratio,
+              ss->sep[0],ss->sep[1],ss->sep[2],score);
         if (score>best.score) {
             best.mode=def->mode;
             best.id=def->id;
@@ -318,6 +559,8 @@ static void evalfde(rtk_t *rtk)
     mon->act=best;
     rtk->int_fde_mode=best.mode;
     rtk->int_fde_sat=best.sat;
+    trace(3,"fde best : subset=%d mode=%d sat=%d score=%.4f act=%d\n",
+          best.id,best.mode,best.sat,best.score,best.act);
 }
 
 static void subout(const rtk_t *rtk)
@@ -340,6 +583,20 @@ static void subout(const rtk_t *rtk)
     }
 }
 
+static double phase_rms(const rtk_t *rtk, int *count)
+{
+    double s=0.0;
+    int i,f,n=0,nf=NF_(&rtk->opt);
+    for (i=0;i<MAXSAT;i++) for (f=0;f<nf&&f<NFREQ;f++) {
+        double r=rtk->ssat[i].resc[f];
+        if (!rtk->ssat[i].vsat[f]||r==0.0) continue;
+        s+=r*r;
+        n++;
+    }
+    if (count) *count=n;
+    return n>0?sqrt(s/n):0.0;
+}
+
 EXPORT void rtkint_init(rtk_t *rtk, const prcopt_t *opt)
 {
     memset(&rtk->intg,0,sizeof(rtk->intg));
@@ -347,6 +604,9 @@ EXPORT void rtkint_init(rtk_t *rtk, const prcopt_t *opt)
     rtk->int_reproc=0;
     rtk->int_fde_mode=0;
     rtk->int_fde_sat=0;
+    rtk->int_fde_pre_mode=0;
+    rtk->int_fde_pre_sat=0;
+    rtk->int_fde_action=0;
     rtk->int_hpl=rtk->int_vpl=0.0;
 }
 
@@ -354,7 +614,65 @@ EXPORT void rtkint_free(rtk_t *rtk)
 {
     int i;
     for (i=0;i<rtk->intg.ndef;i++) freechild(rtk->intg.ss+i);
+    free(rtk->intg.bH); rtk->intg.bH=NULL;
+    free(rtk->intg.bR); rtk->intg.bR=NULL;
+    free(rtk->intg.bv); rtk->intg.bv=NULL;
     memset(&rtk->intg,0,sizeof(rtk->intg));
+}
+
+EXPORT void rtkint_saveddr(rtk_t *rtk, const double *H, const double *R,
+                           const double *v, const int *vflg, int nx, int nv)
+{
+    rtkint_t *mon=&rtk->intg;
+    int i,n=nv;
+    if (!rtk->opt.enable_rtk_integrity_monitor||rtk->int_child) return;
+    if (!H||!R||!v||!vflg||nx<=0||nv<=0) return;
+    if (n>RTKINT_MAX_BIAS_ROWS) n=RTKINT_MAX_BIAS_ROWS;
+    if (mon->bnx!=nx||!mon->bH) {
+        free(mon->bH);
+        mon->bH=(double *)malloc(sizeof(double)*nx*RTKINT_MAX_BIAS_ROWS);
+    }
+    if (!mon->bR) mon->bR=(double *)malloc(sizeof(double)*RTKINT_MAX_BIAS_ROWS*RTKINT_MAX_BIAS_ROWS);
+    if (!mon->bv) mon->bv=(double *)malloc(sizeof(double)*RTKINT_MAX_BIAS_ROWS);
+    if (!mon->bH||!mon->bR||!mon->bv) return;
+    mon->bnx=nx;
+    mon->bnv=n;
+    for (i=0;i<n;i++) {
+        mon->bflg[i]=vflg[i];
+        mon->bv[i]=v[i];
+    }
+    matcpy(mon->bH,H,nx,n);
+    for (i=0;i<n*n;i++) mon->bR[i]=0.0;
+    for (i=0;i<n;i++) {
+        int j;
+        for (j=0;j<n;j++) mon->bR[i+j*n]=R[i+j*nv];
+    }
+}
+
+EXPORT void rtkint_export_rbias(const rtk_t *rtk, const double *v,
+                                const int *vflg, int nv)
+{
+    double tow;
+    int week,i,qi;
+    if (!fp_rbias||!out_rbias||!rtk->opt.enable_rtk_integrity_rbias_export) return;
+    if (!v||!vflg||nv<=0) return;
+    tow=time2gpst(rtk->sol.time,&week);
+    qi=rtk->sol.stat>=SOLQ_FIX?rtk->sol.stat:SOLQ_FIX;
+    for (i=0;i<nv;i++) {
+        int sf=(vflg[i]>>16)&0xFF;
+        int su=(vflg[i]>>8)&0xFF;
+        int meas=(vflg[i]>>4)&0xF;
+        int frq=(vflg[i]&0xF)+1;
+        int sys=satsys(su,NULL),si=sysidx(sys);
+        char idu[16],idf[16];
+        if (sf<=0||su<=0||si<0) continue;
+        satno2id(su,idu);
+        satno2id(sf,idf);
+        fprintf(fp_rbias,"$RBIAS,%s,%.3f,%d,%d,%.3f,%d,%s,%d,%s,%s,%s,%.6f,%.6f\n",
+            time_str(rtk->sol.time,3),tow,rtk->sol.ns,qi,
+            rtk->sol.ratio,si,systxt(sys),frq,meas?"CODE":"PHASE",
+            idu,idf,v[i],fabs(v[i]));
+    }
 }
 
 EXPORT void rtkint_update(rtk_t *rtk, const obsd_t *obs, int nobs,
@@ -363,6 +681,11 @@ EXPORT void rtkint_update(rtk_t *rtk, const obsd_t *obs, int nobs,
     rtkint_t *mon=&rtk->intg;
     int sat[MAXSAT],ns,i,nu,nr;
     if (!rtk->opt.enable_rtk_integrity_monitor||rtk->int_child) return;
+    if (rtk->int_reproc<=0) {
+        rtk->int_fde_pre_mode=0;
+        rtk->int_fde_pre_sat=0;
+        rtk->int_fde_action=0;
+    }
     mon->ena=mon->init=1;
     for (i=0;i<mon->ndef;i++) mon->ss[i].act=0;
     ns=commonsat(obs,nobs,sat);
@@ -405,26 +728,42 @@ EXPORT int rtkint_redo(const rtk_t *rtk, int *mode, int *sat)
 EXPORT int rtkint_open(const char *outfile, const prcopt_t *opt)
 {
     char path[1024];
-    if (!opt->enable_rtk_integrity_monitor||!outfile||!*outfile) return 0;
-    setpath(path,outfile,".pint");
-    fp_pint=fopen(path,"w");
-    setpath(path,outfile,".pldiag");
-    fp_pld=fopen(path,"w");
-    out_sub=opt->enable_rtk_integrity_subset_debug_output;
-    out_rbias=opt->enable_rtk_integrity_rbias_export;
-    if (out_sub) {
-        setpath(path,outfile,".subdiag");
-        fp_sub=fopen(path,"w");
+    if ((!opt->enable_rtk_integrity_monitor&&!opt->enable_rtk_integrity_rbias_export
+#if !ENABLE_RTK_DEBUG_OUTPUT
+        )
+#else
+        &&1)
+#endif
+        ||!outfile||!*outfile) return 0;
+    setbasename(rbias_path_hint,outfile,"rbias_params.csv");
+    if (opt->enable_rtk_integrity_monitor) {
+        setpath(path,outfile,".pint");
+        fp_pint=fopen(path,"w");
+        setpath(path,outfile,".pldiag");
+        fp_pld=fopen(path,"w");
+        out_sub=opt->enable_rtk_integrity_subset_debug_output;
+        if (out_sub) {
+            setpath(path,outfile,".subdiag");
+            fp_sub=fopen(path,"w");
+        }
     }
+    else {
+        out_sub=0;
+    }
+    out_rbias=opt->enable_rtk_integrity_rbias_export;
     if (out_rbias) {
         setpath(path,outfile,".rbias");
         fp_rbias=fopen(path,"w");
     }
-    if (fp_pint) fprintf(fp_pint,"%% time x y z nsat QI ratio sigma0 subset_total subset_active HPL VPL FDEmode FDEsat\n");
-    if (fp_pld) fprintf(fp_pld,"%% time nsat QI ratio subset_total subset_active HPL VPL bias_e bias_n bias_u HPL0 VPL0 Hsrc Hmode Hsat HsigE HsigN HsigU HsepE HsepN HsepU Vsrc Vmode Vsat VsigE VsigN VsigU VsepE VsepN VsepU\n");
+    if (fp_pint) fprintf(fp_pint,"%% time x y z nsat QI ratio sigma0 subset_total subset_active HPL VPL FDEmode FDEsat phase_res_rms phase_res_count FDEpreMode FDEpreSat FDEaction\n");
+    if (fp_pld) fprintf(fp_pld,"%% time nsat QI ratio subset_total subset_active HPL VPL bias_e bias_n bias_u HPL0 VPL0 HADD VADD bias_loaded bias_rows Hsrc Hmode Hsat HsigE HsigN HsigU HsepE HsepN HsepU Vsrc Vmode Vsat VsigE VsigN VsigU VsepE VsepN VsepU FDEpreMode FDEpreSat FDEaction\n");
     if (fp_sub) fprintf(fp_sub,"%% time subset mode sat valid amb_cond x y z sep_e sep_n sep_u\n");
-    if (fp_rbias) fprintf(fp_rbias,"%% time sat res bias_e bias_n bias_u\n");
-    return fp_pint||fp_pld;
+    if (fp_rbias) fprintf(fp_rbias,"%% $RBIAS,time,tow_s,nsat,qi,ratio,sysidx,sys,band,meas,sat_u,sat_f,resid_m,absres_m\n");
+    return fp_pint||fp_pld||fp_rbias
+#if ENABLE_RTK_DEBUG_OUTPUT
+        ||0
+#endif
+        ;
 }
 
 EXPORT void rtkint_close(void)
@@ -433,6 +772,152 @@ EXPORT void rtkint_close(void)
     if (fp_pld) fclose(fp_pld); fp_pld=NULL;
     if (fp_sub) fclose(fp_sub); fp_sub=NULL;
     if (fp_rbias) fclose(fp_rbias); fp_rbias=NULL;
+    rbias_path_hint[0]='\0';
+}
+
+EXPORT int rtk_debug_open(const char *outfile)
+{
+#if ENABLE_RTK_DEBUG_OUTPUT
+    char path[1024];
+    if (!outfile||!*outfile) return 0;
+    setpath(path,outfile,".rtk_debug");
+    fp_rtk_dbg=fopen(path,"w");
+    if (fp_rtk_dbg) {
+        fprintf(fp_rtk_dbg,
+            "%% type time stage action sat kept_obs total_obs stat ns ratio sigma0 nx na rr0 rr1 rr2 drr0 drr1 drr2\n");
+        fprintf(fp_rtk_dbg,
+            "%% RAWCOUNTS time stage n nu nr\n");
+        fprintf(fp_rtk_dbg,
+            "%% RAWSATSET time stage count sat_list\n");
+        fprintf(fp_rtk_dbg,
+            "%% RAWLINE time stage satid preset_sat decoded_sat ok\n");
+        fprintf(fp_rtk_dbg,
+            "%% SATSET time stage count sat_list\n");
+    }
+    return fp_rtk_dbg!=NULL;
+#else
+    (void)outfile;
+    return 0;
+#endif
+}
+
+EXPORT void rtk_debug_close(void)
+{
+#if ENABLE_RTK_DEBUG_OUTPUT
+    if (fp_rtk_dbg) fclose(fp_rtk_dbg); fp_rtk_dbg=NULL;
+#endif
+}
+
+EXPORT void rtk_debug_epoch(const rtk_t *rtk, const char *stage,
+                            int action, int sat, int kept_obs, int total_obs,
+                            int stat_before, int ns_before, float ratio_before,
+                            double ftest_before, const double *rr_before)
+{
+#if ENABLE_RTK_DEBUG_OUTPUT
+    const sol_t *sol;
+    double d0=0.0,d1=0.0,d2=0.0;
+    if (!fp_rtk_dbg||!rtk||!stage) return;
+    sol=&rtk->sol;
+    if (rr_before) {
+        d0=sol->rr[0]-rr_before[0];
+        d1=sol->rr[1]-rr_before[1];
+        d2=sol->rr[2]-rr_before[2];
+    }
+    fprintf(fp_rtk_dbg,
+        "EPOCH %s %s %d %d %d %d %d %d %.3f %.4f %d %d %.4f %.4f %.4f %.4f %.4f %.4f\n",
+        time_str(sol->time,3),stage,action,sat,kept_obs,total_obs,
+        !strcmp(stage,"before")?stat_before:sol->stat,
+        !strcmp(stage,"before")?ns_before:sol->ns,
+        !strcmp(stage,"before")?ratio_before:sol->ratio,
+        !strcmp(stage,"before")?ftest_before:sol->Ftestvalue,
+        rtk->nx,rtk->na,sol->rr[0],sol->rr[1],sol->rr[2],d0,d1,d2);
+    fflush(fp_rtk_dbg);
+#else
+    (void)rtk; (void)stage; (void)action; (void)sat; (void)kept_obs; (void)total_obs;
+    (void)stat_before; (void)ns_before; (void)ratio_before; (void)ftest_before; (void)rr_before;
+#endif
+}
+
+EXPORT void rtk_debug_satset(const rtk_t *rtk, const char *stage,
+                             const obsd_t *obs, int nobs)
+{
+#if ENABLE_RTK_DEBUG_OUTPUT
+    int i;
+    char id[32];
+    if (!fp_rtk_dbg||!rtk||!stage||!obs||nobs<=0) return;
+    fprintf(fp_rtk_dbg,"SATSET %s %s %d",time_str(rtk->sol.time,3),stage,nobs);
+    for (i=0;i<nobs;i++) {
+        satno2id(obs[i].sat,id);
+        fprintf(fp_rtk_dbg," %s",id);
+    }
+    fputc('\n',fp_rtk_dbg);
+    fflush(fp_rtk_dbg);
+#else
+    (void)rtk; (void)stage; (void)obs; (void)nobs;
+#endif
+}
+
+EXPORT void rtk_debug_rawcounts(const char *stage, gtime_t time,
+                                int nobs, int nu, int nr)
+{
+#if ENABLE_RTK_DEBUG_OUTPUT
+    FILE *fp=fp_rtk_dbg;
+    if (!fp||!stage) return;
+    fprintf(fp,"RAWCOUNTS %s %s %d %d %d\n",
+            time_str(time,3),stage,nobs,nu,nr);
+    fflush(fp);
+#else
+    (void)stage; (void)time; (void)nobs; (void)nu; (void)nr;
+#endif
+}
+
+EXPORT void rtk_debug_rawset(const char *stage, gtime_t time,
+                             const obsd_t *obs, int nobs)
+{
+#if ENABLE_RTK_DEBUG_OUTPUT
+    int i;
+    char id[32];
+    FILE *fp=fp_rtk_dbg;
+    if (!fp||!stage||!obs||nobs<=0) return;
+    fprintf(fp,"RAWSATSET %s %s %d",time_str(time,3),stage,nobs);
+    for (i=0;i<nobs;i++) {
+        satno2id(obs[i].sat,id);
+        fprintf(fp," %s",id);
+    }
+    fputc('\n',fp);
+    fflush(fp);
+#else
+    (void)stage; (void)time; (void)obs; (void)nobs;
+#endif
+}
+
+EXPORT void rtk_debug_rawline(const char *stage, gtime_t time,
+                              const char *satid, int preset_sat,
+                              int decoded_sat, int ok)
+{
+#if ENABLE_RTK_DEBUG_OUTPUT
+    FILE *fp=fp_rtk_dbg;
+    if (!fp||!stage) return;
+    fprintf(fp,"RAWLINE %s %s %s %d %d %d\n",
+            time_str(time,3),stage,satid&&*satid?satid:"---",
+            preset_sat,decoded_sat,ok);
+    fflush(fp);
+#else
+    (void)stage; (void)time; (void)satid; (void)preset_sat; (void)decoded_sat; (void)ok;
+#endif
+}
+
+EXPORT void rtk_debug_counts(const rtk_t *rtk, const char *stage,
+                             int nobs, int nu, int nr)
+{
+#if ENABLE_RTK_DEBUG_OUTPUT
+    if (!fp_rtk_dbg||!rtk||!stage) return;
+    fprintf(fp_rtk_dbg,"COUNTS %s %s %d %d %d\n",
+            time_str(rtk->sol.time,3),stage,nobs,nu,nr);
+    fflush(fp_rtk_dbg);
+#else
+    (void)rtk; (void)stage; (void)nobs; (void)nu; (void)nr;
+#endif
 }
 
 EXPORT void rtkint_out(const rtk_t *rtk)
@@ -441,19 +926,25 @@ EXPORT void rtkint_out(const rtk_t *rtk)
     const rtkint_pl_t *pl=&mon->pl;
     if (!rtk->opt.enable_rtk_integrity_monitor||!mon->init) return;
     if (fp_pint) {
-        fprintf(fp_pint,"%s %.4f %.4f %.4f %d %d %.3f %.4f %d %d %.4f %.4f %d %d\n",
+        int phase_count=0;
+        double phase_r=phase_rms(rtk,&phase_count);
+        fprintf(fp_pint,"%s %.4f %.4f %.4f %d %d %.3f %.4f %d %d %.4f %.4f %d %d %.6f %d %d %d %d\n",
             time_str(mon->ep.time,3),rtk->sol.rr[0],rtk->sol.rr[1],rtk->sol.rr[2],
             rtk->sol.ns,rtk->sol.stat,rtk->sol.ratio,rtk->sol.Ftestvalue,
-            mon->ndef,mon->nact,pl->hpl,pl->vpl,mon->fde.mode,mon->fde.sat);
+            mon->ndef,mon->nact,pl->hpl,pl->vpl,mon->fde.mode,mon->fde.sat,
+            phase_r,phase_count,rtk->int_fde_pre_mode,rtk->int_fde_pre_sat,
+            rtk->int_fde_action);
     }
     if (fp_pld) {
-        fprintf(fp_pld,"%s %d %d %.3f %d %d %.4f %.4f %.4f %.4f %.4f %.4f %.4f %d %d %d %.4f %.4f %.4f %.4f %.4f %.4f %d %d %d %.4f %.4f %.4f %.4f %.4f %.4f\n",
+        fprintf(fp_pld,"%s %d %d %.3f %d %d %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %d %d %d %d %d %.4f %.4f %.4f %.4f %.4f %.4f %d %d %d %.4f %.4f %.4f %.4f %.4f %.4f %d %d %d\n",
             time_str(mon->ep.time,3),rtk->sol.ns,rtk->sol.stat,rtk->sol.ratio,
             mon->ndef,mon->nact,pl->hpl,pl->vpl,pl->be,pl->bn,pl->bu,pl->hpl0,
-            pl->vpl0,pl->hsrc,pl->hmode,pl->hsat,pl->hsig[0],pl->hsig[1],
+            pl->vpl0,pl->hadd,pl->vadd,pl->bias_loaded,pl->bias_rows,
+            pl->hsrc,pl->hmode,pl->hsat,pl->hsig[0],pl->hsig[1],
             pl->hsig[2],pl->hsep[0],pl->hsep[1],pl->hsep[2],pl->vsrc,
             pl->vmode,pl->vsat,pl->vsig[0],pl->vsig[1],pl->vsig[2],
-            pl->vsep[0],pl->vsep[1],pl->vsep[2]);
+            pl->vsep[0],pl->vsep[1],pl->vsep[2],rtk->int_fde_pre_mode,
+            rtk->int_fde_pre_sat,rtk->int_fde_action);
     }
     subout(rtk);
 }

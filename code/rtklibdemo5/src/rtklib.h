@@ -1,4 +1,4 @@
-/*------------------------------------------------------------------------------
+﻿/*------------------------------------------------------------------------------
 * rtklib.h : rtklib constants, types and function prototypes
 *
 *          Copyright (C) 2007-2019 by T.TAKASU, All rights reserved.
@@ -38,7 +38,19 @@
 #define ENACMP
 #define ENAQZS
 #define ENAIRN
+
+#ifndef ENABLE_RTK_INTEGRITY
 #define ENABLE_RTK_INTEGRITY
+#endif
+#ifndef ENABLE_RTK_DEBUG_OUTPUT
+#define ENABLE_RTK_DEBUG_OUTPUT 0
+#endif
+#ifndef ENABLE_RTK_SKIP_EPOCH
+#define ENABLE_RTK_SKIP_EPOCH 0
+#endif
+#ifndef ENABLE_RTK_ARAIM_PL_BIAS_TERM
+#define ENABLE_RTK_ARAIM_PL_BIAS_TERM 1
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1187,10 +1199,14 @@ typedef struct {        /* processing options type */
     int rtk_integrity_debug_satellite;
     double rtk_integrity_debug_pl_threshold;
 #endif
-    
+
     //设置PLD的最大和最小阈值
     int chkMaxPLD;//设置PLD最大阈值为100
     int chkMinPLD;//设置PLD最小阈值为6
+#if ENABLE_RTK_SKIP_EPOCH
+    double rtk_skip_epoch_time[6];
+    int rtk_skip_epoch_satellite;
+#endif
 } prcopt_t;
 
 typedef struct {        /* solution options type */
@@ -1339,6 +1355,9 @@ typedef struct rtk_tag {        /* RTK control/result type */
     int int_reproc;      /* FDE reprocess depth */
     int int_fde_mode;    /* last FDE mode */
     int int_fde_sat;     /* last FDE satellite */
+    int int_fde_pre_mode; /* FDE mode before recovery reprocess */
+    int int_fde_pre_sat;  /* FDE satellite before recovery reprocess */
+    int int_fde_action;   /* recovery action applied in this epoch */
     double int_hpl,int_vpl; /* last protection level */
 #endif
 
@@ -1953,12 +1972,33 @@ EXPORT int pntpos(const obsd_t *obs, int n, const nav_t *nav,
 EXPORT void rtkinit(rtk_t *rtk, const prcopt_t *opt);
 EXPORT void rtkfree(rtk_t *rtk);
 EXPORT int  rtkpos (rtk_t *rtk, const obsd_t *obs, int nobs, const nav_t *nav, const sta_t* stalin);
+EXPORT int  rtk_debug_open(const char *outfile);
+EXPORT void rtk_debug_close(void);
+EXPORT void rtk_debug_epoch(const rtk_t *rtk, const char *stage,
+                            int action, int sat, int kept_obs, int total_obs,
+                            int stat_before, int ns_before, float ratio_before,
+                            double ftest_before, const double *rr_before);
+EXPORT void rtk_debug_rawcounts(const char *stage, gtime_t time,
+                                int nobs, int nu, int nr);
+EXPORT void rtk_debug_rawset(const char *stage, gtime_t time,
+                             const obsd_t *obs, int nobs);
+EXPORT void rtk_debug_rawline(const char *stage, gtime_t time,
+                              const char *satid, int preset_sat,
+                              int decoded_sat, int ok);
+EXPORT void rtk_debug_satset(const rtk_t *rtk, const char *stage,
+                             const obsd_t *obs, int nobs);
+EXPORT void rtk_debug_counts(const rtk_t *rtk, const char *stage,
+                             int nobs, int nu, int nr);
 #ifdef ENABLE_RTK_INTEGRITY
 EXPORT void rtkint_init(rtk_t *rtk, const prcopt_t *opt);
 EXPORT void rtkint_free(rtk_t *rtk);
 EXPORT void rtkint_update(rtk_t *rtk, const obsd_t *obs, int nobs,
                           const nav_t *nav, const sta_t *sta);
 EXPORT int  rtkint_redo(const rtk_t *rtk, int *mode, int *sat);
+EXPORT void rtkint_saveddr(rtk_t *rtk, const double *H, const double *R,
+                           const double *v, const int *vflg, int nx, int nv);
+EXPORT void rtkint_export_rbias(const rtk_t *rtk, const double *v,
+                                const int *vflg, int nv);
 EXPORT int  rtkint_open(const char *outfile, const prcopt_t *opt);
 EXPORT void rtkint_close(void);
 EXPORT void rtkint_out(const rtk_t *rtk);

@@ -80,6 +80,33 @@ static gtime_t invalidtm[100]={{0}};/* invalid time marks */
 static rtcm_t rtcm;             /* rtcm control struct */
 static FILE *fp_rtcm=NULL;      /* rtcm data file pointer */
 
+#if ENABLE_RTK_SKIP_EPOCH
+static int skip_epoch_applied = 0;
+
+static int apply_skip_epoch_experiment(obsd_t *obs, int nobs,
+                                       const prcopt_t *popt)
+{
+    gtime_t target;
+    int i,n=0,removed=0;
+    if (skip_epoch_applied||nobs<=0||!popt) return nobs;
+    if (popt->rtk_skip_epoch_satellite<=0) return nobs;
+    if (popt->rtk_skip_epoch_time[0]<=0.0) return nobs;
+    target=epoch2time(popt->rtk_skip_epoch_time);
+    if (timediff(obs[0].time,target)<-DTTOL) return -1;
+    for (i=0;i<nobs;i++) {
+        if (obs[i].sat==popt->rtk_skip_epoch_satellite) {
+            removed++;
+            continue;
+        }
+        obs[n++]=obs[i];
+    }
+    skip_epoch_applied=1;
+    rtk_debug_rawcounts("exp_after_drop",obs[0].time,n,n,removed);
+    rtk_debug_rawset("exp_after_drop",obs[0].time,obs,n);
+    return n;
+}
+#endif
+
 /* show message and check break ----------------------------------------------*/
 static int checkbrk(const char *format, ...)
 {
@@ -262,8 +289,20 @@ static int inputobs(obsd_t *obs, int solq, const prcopt_t *popt)
         if (nr<=0) {
             nr=nextobsf(&obss,&iobsr,2);
         }
+        if (nu>0) {
+            rtk_debug_rawcounts("raw_rover",obss.data[iobsu].time,nu,nu,0);
+            rtk_debug_rawset("raw_rover",obss.data[iobsu].time,obss.data+iobsu,nu);
+        }
+        if (nr>0) {
+            rtk_debug_rawcounts("raw_base",obss.data[iobsr].time,nr,0,nr);
+            rtk_debug_rawset("raw_base",obss.data[iobsr].time,obss.data+iobsr,nr);
+        }
         for (i=0;i<nu&&n<MAXOBS*2;i++) obs[n++]=obss.data[iobsu+i];
         for (i=0;i<nr&&n<MAXOBS*2;i++) obs[n++]=obss.data[iobsr+i];
+        if (n>0) {
+            rtk_debug_rawcounts("raw_pair",obs[0].time,n,nu,nr);
+            rtk_debug_rawset("raw_pair",obs[0].time,obs,n);
+        }
         iobsu+=nu;
         
         /* update sbas corrections */
@@ -299,8 +338,20 @@ static int inputobs(obsd_t *obs, int solq, const prcopt_t *popt)
                 if (timediff(obss.data[i].time,obss.data[iobsu].time)<-DTTOL) break;
         }
         nr=nextobsb(&obss,&iobsr,2);
+        if (nu>0) {
+            rtk_debug_rawcounts("raw_rover_b",obss.data[iobsu-nu+1].time,nu,nu,0);
+            rtk_debug_rawset("raw_rover_b",obss.data[iobsu-nu+1].time,obss.data+iobsu-nu+1,nu);
+        }
+        if (nr>0) {
+            rtk_debug_rawcounts("raw_base_b",obss.data[iobsr-nr+1].time,nr,0,nr);
+            rtk_debug_rawset("raw_base_b",obss.data[iobsr-nr+1].time,obss.data+iobsr-nr+1,nr);
+        }
         for (i=0;i<nu&&n<MAXOBS*2;i++) obs[n++]=obss.data[iobsu-nu+1+i];
         for (i=0;i<nr&&n<MAXOBS*2;i++) obs[n++]=obss.data[iobsr-nr+1+i];
+        if (n>0) {
+            rtk_debug_rawcounts("raw_pair_b",obs[0].time,n,nu,nr);
+            rtk_debug_rawset("raw_pair_b",obs[0].time,obs,n);
+        }
         iobsu-=nu;
         
         /* update sbas corrections */
@@ -434,6 +485,11 @@ static void procpos(FILE *fp, FILE *fptm, const prcopt_t *popt, const solopt_t *
         if (obs[0].time.sec > 0.09) {
             continue;
         }
+#if ENABLE_RTK_SKIP_EPOCH
+        nobs=apply_skip_epoch_experiment(obs,nobs,popt);
+        if (nobs<0) continue;
+        if (nobs<=0) continue;
+#endif
         /* exclude satellites */
         for (i=n=0;i<nobs;i++) {
             sys = satsys(obs[i].sat, &prn);
@@ -1179,6 +1235,9 @@ static int execses(gtime_t ts, gtime_t te, double ti, const prcopt_t *popt,
         rtkclosestat();
         rtkopenstat(statfile,sopt->sstat);
     }
+#if ENABLE_RTK_DEBUG_OUTPUT
+    rtk_debug_open(outfile);
+#endif
 #ifdef ENABLE_RTK_INTEGRITY
     if (flag) rtkint_open(outfile,&popt_);
 #endif
@@ -1194,6 +1253,9 @@ static int execses(gtime_t ts, gtime_t te, double ti, const prcopt_t *popt,
     ////outhead(outfiletm,infile,n,&popt_,&tmsopt);
 
     iobsu=iobsr=isbs=ilex=revs=aborts=0;
+#if ENABLE_RTK_SKIP_EPOCH
+    skip_epoch_applied=0;
+#endif
     
     if (popt_.mode==PMODE_SINGLE||popt_.soltype==0) {
         if ((fp=openfile(outfile)) && (fptm=openfile(outfiletm))) {
@@ -1236,6 +1298,9 @@ static int execses(gtime_t ts, gtime_t te, double ti, const prcopt_t *popt,
         free(rbb);
     }
     rtkfree(&rtk);
+#if ENABLE_RTK_DEBUG_OUTPUT
+    rtk_debug_close();
+#endif
 #ifdef ENABLE_RTK_INTEGRITY
     rtkint_close();
 #endif

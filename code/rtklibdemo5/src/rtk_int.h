@@ -1,4 +1,4 @@
-#ifndef RTK_INT_H
+﻿#ifndef RTK_INT_H
 #ifndef RTKLIB_IN_RTK_INT
 #include "rtklib.h"
 #else
@@ -11,6 +11,7 @@
 #define RTKINT_A_NONE   0
 #define RTKINT_A_SAT    1
 #define RTKINT_A_FLOAT  2
+#define RTKINT_MAX_BIAS_ROWS (MAXOBS*NFREQ*2+1)
 
 struct rtk_tag;
 
@@ -49,9 +50,11 @@ typedef struct {
 typedef struct {
     double hpl,vpl;
     double hpl0,vpl0;
+    double hadd,vadd;
     double be,bn,bu;
     double pe,pn,pu;
     double msig[3];
+    int bias_loaded,bias_rows;
     int hsrc,hmode,hsat;
     int vsrc,vmode,vsat;
     double hsig[3],vsig[3];
@@ -79,6 +82,9 @@ typedef struct {
     rtkint_fde_t act;
     int child;
     int retry;
+    int bnx,bnv;
+    int bflg[RTKINT_MAX_BIAS_ROWS];
+    double *bH,*bR,*bv;
 } rtkint_t;
 
 #endif

@@ -1,4 +1,4 @@
-/*------------------------------------------------------------------------------
+﻿/*------------------------------------------------------------------------------
 * rtkpos.c : precise positioning
 *
 *          Copyright (C) 2007-2018 by T.TAKASU, All rights reserved.
@@ -2830,6 +2830,9 @@ static int relpos(rtk_t* rtk, const obsd_t* obs, int nu, int nr,
 			rtk->sol.numofnv = 0;
 			break;
 		}
+#ifdef ENABLE_RTK_INTEGRITY
+		rtkint_saveddr(rtk,H,R,v,vflg,rtk->nx,nv);
+#endif
 
 		/* kalman filter measurement update, updates x,y,z,sat phase biases, etc
 				K=P*H*(H'*P*H+R)^-1
@@ -2943,6 +2946,9 @@ static int relpos(rtk_t* rtk, const obsd_t* obs, int nu, int nr,
 						}
 					}
 					stat = SOLQ_FIX;
+#ifdef ENABLE_RTK_INTEGRITY
+					rtkint_export_rbias(rtk,v,vflg,nv);
+#endif
 				}
 			}
 		}
@@ -3247,6 +3253,16 @@ extern int rtkpos(rtk_t* rtk, const obsd_t* obs, int n, const nav_t* nav, const 
 	}
 	/* relative potitioning */
 	relpos(rtk, obs, nu, nr, nav);
+#if ENABLE_RTK_DEBUG_OUTPUT
+    if (!rtk->int_child&&rtk->int_reproc<=0) {
+        double rr_normal[3]={rtk->sol.rr[0],rtk->sol.rr[1],rtk->sol.rr[2]};
+        rtk_debug_counts(rtk,"entry",n,nu,nr);
+        rtk_debug_epoch(rtk,"normal",0,0,n,n,
+                        rtk->sol.stat,rtk->sol.ns,rtk->sol.ratio,
+                        rtk->sol.Ftestvalue,rr_normal);
+        rtk_debug_satset(rtk,"normal",obs,n);
+    }
+#endif
 #ifdef ENABLE_RTK_INTEGRITY
 	if (!rtk->int_child) {
 		int fde_mode=0,fde_sat=0;
@@ -3254,16 +3270,56 @@ extern int rtkpos(rtk_t* rtk, const obsd_t* obs, int n, const nav_t* nav, const 
 		if (rtk->int_reproc<=0&&rtkint_redo(rtk,&fde_mode,&fde_sat)) {
 			obsd_t obs_fde[MAXOBS*2];
 			prcopt_t opt_save=rtk->opt;
+			int fde_pre_mode=rtk->int_fde_mode;
+			int fde_pre_sat=rtk->int_fde_sat;
+			int fde_action=fde_mode;
 			int m=0;
+            double rr_before[3]={rtk->sol.rr[0],rtk->sol.rr[1],rtk->sol.rr[2]};
+            int stat_before=rtk->sol.stat;
+            int ns_before=rtk->sol.ns;
+            float ratio_before=rtk->sol.ratio;
+            double ftest_before=rtk->sol.Ftestvalue;
+#if ENABLE_RTK_DEBUG_OUTPUT
+            rtk_debug_epoch(rtk,"before",fde_action,fde_sat,n,n,
+                            stat_before,ns_before,ratio_before,ftest_before,rr_before);
+            rtk_debug_satset(rtk,"before",obs,n);
+            rtk_debug_epoch(rtk,"redo_trigger",fde_action,fde_sat,n,n,
+                            stat_before,ns_before,ratio_before,ftest_before,rr_before);
+#endif
 			for (i=0;i<n;i++) {
 				if (fde_mode==RTKINT_A_SAT&&obs[i].sat==fde_sat) continue;
 				obs_fde[m++]=obs[i];
 			}
+#if ENABLE_RTK_DEBUG_OUTPUT
+            rtk_debug_satset(rtk,"after_exclude",obs_fde,m);
+            rtk_debug_satset(rtk,"redo_satset",obs_fde,m);
+#endif
+            trace(3,
+                  "fde redo before: time=%s action=%d sat=%d pre_mode=%d pre_sat=%d "
+                  "stat=%d ns=%d ratio=%.3f ftest=%.4f rr=%.4f %.4f %.4f kept_obs=%d/%d\n",
+                  time_str(rtk->sol.time,3),fde_mode,fde_sat,fde_pre_mode,fde_pre_sat,
+                  stat_before,ns_before,ratio_before,ftest_before,
+                  rr_before[0],rr_before[1],rr_before[2],m,n);
 			if (fde_mode==RTKINT_A_FLOAT) opt_save.modear=ARMODE_OFF;
 			rtkfree(rtk);
 			rtkinit(rtk,&opt_save);
 			rtk->int_reproc=1;
+			rtk->int_fde_pre_mode=fde_pre_mode;
+			rtk->int_fde_pre_sat=fde_pre_sat;
+			rtk->int_fde_action=fde_action;
 			rtkpos(rtk,obs_fde,m,nav,stalin);
+#if ENABLE_RTK_DEBUG_OUTPUT
+            rtk_debug_epoch(rtk,"after",fde_action,fde_sat,m,n,
+                            stat_before,ns_before,ratio_before,ftest_before,rr_before);
+            rtk_debug_epoch(rtk,"redo_result",fde_action,fde_sat,m,n,
+                            stat_before,ns_before,ratio_before,ftest_before,rr_before);
+#endif
+            trace(3,
+                  "fde redo after : time=%s action=%d sat=%d stat=%d ns=%d ratio=%.3f "
+                  "ftest=%.4f rr=%.4f %.4f %.4f drr=%.4f %.4f %.4f\n",
+                  time_str(rtk->sol.time,3),fde_action,fde_sat,rtk->sol.stat,rtk->sol.ns,
+                  rtk->sol.ratio,rtk->sol.Ftestvalue,rtk->sol.rr[0],rtk->sol.rr[1],rtk->sol.rr[2],
+                  rtk->sol.rr[0]-rr_before[0],rtk->sol.rr[1]-rr_before[1],rtk->sol.rr[2]-rr_before[2]);
 			rtk->int_reproc=0;
 		}
 	}
