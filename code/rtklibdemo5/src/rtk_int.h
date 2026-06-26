@@ -4,14 +4,14 @@
 #else
 #define RTK_INT_H
 
-#define RTKINT_F_NONE   0
-#define RTKINT_F_SAT    1
-#define RTKINT_F_NFIX   2
+#define RTKIM_F_NONE   0
+#define RTKIM_F_SAT    1
+#define RTKIM_F_NFIX   2
 
-#define RTKINT_A_NONE   0
-#define RTKINT_A_SAT    1
-#define RTKINT_A_FLOAT  2
-#define RTKINT_MAX_BIAS_ROWS (MAXOBS*NFREQ*2+1)
+#define RTKIM_A_NONE   0
+#define RTKIM_A_SAT    1
+#define RTKIM_A_FLOAT  2
+#define RTKIM_MAX_BIAS_ROWS (MAXOBS*NFREQ*2+1)
 
 struct rtk_tag;
 
@@ -20,7 +20,7 @@ typedef struct {
     int mode;
     int sat;
     int fixed;
-} rtkint_def_t;
+} rtkim_def_t;
 
 typedef struct {
     int init,act,ready,valid;
@@ -36,7 +36,7 @@ typedef struct {
     int dof;
     int refsat[8];
     int ambc;
-} rtkint_ss_t;
+} rtkim_ss_t;
 
 typedef struct {
     gtime_t time;
@@ -45,7 +45,7 @@ typedef struct {
     double ratio;
     int fixed;
     int fixed_upd;
-} rtkint_ep_t;
+} rtkim_ep_t;
 
 typedef struct {
     double hpl,vpl;
@@ -59,7 +59,7 @@ typedef struct {
     int vsrc,vmode,vsat;
     double hsig[3],vsig[3];
     double hsep[3],vsep[3];
-} rtkint_pl_t;
+} rtkim_pl_t;
 
 typedef struct {
     int mode;
@@ -69,23 +69,24 @@ typedef struct {
     double score;
     double stat[3];
     double thres[3];
-} rtkint_fde_t;
+} rtkim_fde_t;
 
 typedef struct {
     int ena,init;
     int ndef,nact;
-    rtkint_def_t def[MAXSAT+1];
-    rtkint_ss_t ss[MAXSAT+1];
-    rtkint_ep_t ep;
-    rtkint_pl_t pl;
-    rtkint_fde_t fde;
-    rtkint_fde_t act;
+    rtkim_def_t def[MAXSAT+1];
+    rtkim_ss_t ss[MAXSAT+1];
+    rtkim_ep_t ep;
+    rtkim_pl_t pl;
+    rtkim_fde_t fde;
+    rtkim_fde_t act;
     int child;
     int retry;
     int bnx,bnv;
-    int bflg[RTKINT_MAX_BIAS_ROWS];
+    int bflg[RTKIM_MAX_BIAS_ROWS];
     double *bH,*bR,*bv;
-} rtkint_t;
+} rtkim_t;
 
 #endif
 #endif
+

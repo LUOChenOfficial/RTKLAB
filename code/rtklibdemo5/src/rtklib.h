@@ -43,10 +43,10 @@
 #define ENABLE_RTK_INTEGRITY
 #endif
 #ifndef ENABLE_RTK_DEBUG_OUTPUT
-#define ENABLE_RTK_DEBUG_OUTPUT 0
+#define ENABLE_RTK_DEBUG_OUTPUT 1
 #endif
 #ifndef ENABLE_RTK_SKIP_EPOCH
-#define ENABLE_RTK_SKIP_EPOCH 0
+#define ENABLE_RTK_SKIP_EPOCH 1
 #endif
 #ifndef ENABLE_RTK_ARAIM_PL_BIAS_TERM
 #define ENABLE_RTK_ARAIM_PL_BIAS_TERM 1
@@ -1006,9 +1006,10 @@ typedef struct {        /* solution type */
     int QZS_NUM;       /*QZSS satellite number*/
     double test_sd;
     double test_dd;       /*Ambiguity test statistic*/
-    double Ftestvalue;  /*Test the posterior dd residuals using F distribution*/
+    double Ftestvalue;    /*Reserved legacy field for F-test statistic*/
+    double chi2testvalue; /*Posterior dd residual chi-square statistic*/
     double MDBE[12];
-int    numofnv;
+    int    dof;            /*chi-square test degree of freedom*/
 	double dops[4];       /* DOP {GDOP,PDOP,HDOP,VDOP} */
 } sol_t;
 
@@ -1350,7 +1351,7 @@ typedef struct rtk_tag {        /* RTK control/result type */
     int initial_mode;   /* initial positioning mode */
     int numnv[4];      /*the num of code or phase nv of each sys*/
 #ifdef ENABLE_RTK_INTEGRITY
-    rtkint_t intg;       /* RTK integrity monitor */
+    rtkim_t intg;       /* RTK integrity monitor */
     int int_child;       /* child filter flag */
     int int_reproc;      /* FDE reprocess depth */
     int int_fde_mode;    /* last FDE mode */
@@ -1985,23 +1986,26 @@ EXPORT void rtk_debug_rawset(const char *stage, gtime_t time,
 EXPORT void rtk_debug_rawline(const char *stage, gtime_t time,
                               const char *satid, int preset_sat,
                               int decoded_sat, int ok);
-EXPORT void rtk_debug_satset(const rtk_t *rtk, const char *stage,
-                             const obsd_t *obs, int nobs);
 EXPORT void rtk_debug_counts(const rtk_t *rtk, const char *stage,
                              int nobs, int nu, int nr);
+EXPORT void rtk_debug_valtest(gtime_t time, const char *stage, int solstat,
+                              float ratio, int nv, int np, int dof,
+                              double chi2, double chi2_thres, int pass,
+                              const double *v, const double *R,
+                              const int *vflg, int topn);
 #ifdef ENABLE_RTK_INTEGRITY
-EXPORT void rtkint_init(rtk_t *rtk, const prcopt_t *opt);
-EXPORT void rtkint_free(rtk_t *rtk);
-EXPORT void rtkint_update(rtk_t *rtk, const obsd_t *obs, int nobs,
-                          const nav_t *nav, const sta_t *sta);
-EXPORT int  rtkint_redo(const rtk_t *rtk, int *mode, int *sat);
-EXPORT void rtkint_saveddr(rtk_t *rtk, const double *H, const double *R,
-                           const double *v, const int *vflg, int nx, int nv);
-EXPORT void rtkint_export_rbias(const rtk_t *rtk, const double *v,
+EXPORT void rtkim_init(rtk_t *rtk, const prcopt_t *opt);
+EXPORT void rtkim_free(rtk_t *rtk);
+EXPORT void rtkim_detect(rtk_t *rtk, const obsd_t *obs, int nobs,
+                         const nav_t *nav, const sta_t *sta);
+EXPORT void rtkim_assess(rtk_t *rtk);
+EXPORT void rtkim_saveddr(rtk_t *rtk, const double *H, const double *R,
+                            const double *v, const int *vflg, int nx, int nv);
+EXPORT void rtkim_export_rbias(const rtk_t *rtk, const double *v,
                                 const int *vflg, int nv);
-EXPORT int  rtkint_open(const char *outfile, const prcopt_t *opt);
-EXPORT void rtkint_close(void);
-EXPORT void rtkint_out(const rtk_t *rtk);
+EXPORT int  rtkim_open(const char *outfile, const prcopt_t *opt);
+EXPORT void rtkim_close(void);
+EXPORT void rtkim_out(const rtk_t *rtk);
 #endif
 EXPORT int  rtkopenstat(const char *file, int level);
 //EXPORT int  openmodel(const char* file);
@@ -2103,3 +2107,4 @@ extern void settime(gtime_t time);
 }
 #endif
 #endif /* RTKLIB_H */
+

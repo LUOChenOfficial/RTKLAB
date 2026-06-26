@@ -89,7 +89,7 @@ int main(int argc,char *argv)
     char resultpath[] = "F:\\RTKLib-LAB\\result";
 
     //////////////////////////////////////////////////////注意更改文件夹
-    char str_envir[] = "\\Wall\\";
+    char str_envir[] = "\\Build\\";
 
     char* str[5];
     for (int i = 0; i < 5; i++) {
@@ -142,7 +142,7 @@ int main(int argc,char *argv)
     
 #ifdef ENABLE_RTK_INTEGRITY
     /* Integrity master switches */
-    prcopt.enable_rtk_integrity_monitor = 1;
+    prcopt.enable_rtk_integrity_monitor = 0;
     prcopt.enable_rtk_integrity_rbias_export = 0;
 
     /* Monitored fault modes */
@@ -164,9 +164,9 @@ int main(int argc,char *argv)
     prcopt.rtk_skip_epoch_time[1] = 2;
     prcopt.rtk_skip_epoch_time[2] = 4;
     prcopt.rtk_skip_epoch_time[3] = 9;
-    prcopt.rtk_skip_epoch_time[4] = 57;
-    prcopt.rtk_skip_epoch_time[5] = 39;
-    prcopt.rtk_skip_epoch_satellite = 30; /* G30 */
+    prcopt.rtk_skip_epoch_time[4] = 45;
+    prcopt.rtk_skip_epoch_time[5] = 2;
+    prcopt.rtk_skip_epoch_satellite = 108; /* sat号 */
 #endif
 
 	/* Position */

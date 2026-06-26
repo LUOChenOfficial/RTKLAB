@@ -1,4 +1,4 @@
-/*------------------------------------------------------------------------------
+﻿/*------------------------------------------------------------------------------
 * postpos.c : post-processing positioning
 *
 *          Copyright (C) 2007-2016 by T.TAKASU, All rights reserved.
@@ -481,7 +481,7 @@ static void procpos(FILE *fp, FILE *fptm, const prcopt_t *popt, const solopt_t *
     rtcm_path[0]='\0';
     
     while ((nobs=inputobs(obs,rtk->sol.stat,popt))>=0) {
-        /*整秒处理*/
+        /*鏁寸澶勭悊*/
         if (obs[0].time.sec > 0.09) {
             continue;
         }
@@ -530,7 +530,7 @@ static void procpos(FILE *fp, FILE *fptm, const prcopt_t *popt, const solopt_t *
             if (!solstatic) {
                 outsol(fp,&rtk->sol,rtk->rb,sopt);
 #ifdef ENABLE_RTK_INTEGRITY
-                rtkint_out(rtk);
+                rtkim_out(rtk);
 #endif
             }
             else if (time.time==0||pri[rtk->sol.stat]<=pri[sol.stat]) {
@@ -1239,7 +1239,7 @@ static int execses(gtime_t ts, gtime_t te, double ti, const prcopt_t *popt,
     rtk_debug_open(outfile);
 #endif
 #ifdef ENABLE_RTK_INTEGRITY
-    if (flag) rtkint_open(outfile,&popt_);
+    if (flag) rtkim_open(outfile,&popt_);
 #endif
     ///* write header to output file */
     //if (flag&&!outhead(outfile,infile,n,&popt_,sopt)) {
@@ -1302,7 +1302,7 @@ static int execses(gtime_t ts, gtime_t te, double ti, const prcopt_t *popt,
     rtk_debug_close();
 #endif
 #ifdef ENABLE_RTK_INTEGRITY
-    rtkint_close();
+    rtkim_close();
 #endif
     /* free obs and nav data */
     freeobsnav(&obss,&navs);
@@ -1573,3 +1573,4 @@ extern int postpos(gtime_t ts, gtime_t te, double ti, double tu,
     
     return stat;
 }
+

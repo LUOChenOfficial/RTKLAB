@@ -2087,23 +2087,25 @@ static int ddmat(rtk_t* rtk, double* D)
 		/* step through freqs */
 		for (f = 0, k = na; f < nf; f++, k += MAXSAT) {
 
-			/* look for first valid sat (i=state index, i-k=sat index) */
-			for (i = k; i < k + MAXSAT; i++) {
+			/* use the same reference-satellite rule as ddres(): highest elevation */
+			for (i = -1, j = k; j < k + MAXSAT; j++) {
 				/* skip if sat not active */
-				if (rtk->x[i] == 0.0 || !test_sys(rtk->ssat[i - k].sys, m) ||
-					!rtk->ssat[i - k].vsat[f]) {
+				if (rtk->x[j] == 0.0 || !test_sys(rtk->ssat[j - k].sys, m) ||
+					!rtk->ssat[j - k].vsat[f]) {
 					continue;
 				}
-				/* set sat to use for fixing ambiguity if meets criteria */
-				if (rtk->ssat[i - k].lock[f] >= 0 && !(rtk->ssat[i - k].slip[f] & 2) &&
-					rtk->ssat[i - k].azel[1] >= rtk->opt.elmaskar && !nofix) {
-					rtk->ssat[i - k].fix[f] = 2; /* fix */
-					break;/* break out of loop if find good sat */
+				/* keep the best eligible satellite as reference */
+				if (rtk->ssat[j - k].lock[f] >= 0 && !(rtk->ssat[j - k].slip[f] & 2) &&
+					rtk->ssat[j - k].azel[1] >= rtk->opt.elmaskar && !nofix) {
+					if (i < 0 || rtk->ssat[j - k].azel[1] >= rtk->ssat[i - k].azel[1]) {
+						i = j;
+					}
 				}
 				/* else don't use this sat for fixing ambiguity */
-				else rtk->ssat[i - k].fix[f] = 1;
+				else rtk->ssat[j - k].fix[f] = 1;
 			}
-			if (rtk->ssat[i - k].fix[f] != 2) continue;  /* no good sat found */
+			if (i < 0) continue;  /* no good sat found */
+			rtk->ssat[i - k].fix[f] = 2;
 			/* step through all sats (j=state index, j-k=sat index, i-k=first good sat) */
 			for (j = k; j < k + MAXSAT; j++) {
 				if (i == j || rtk->x[j] == 0.0 || !test_sys(rtk->ssat[j - k].sys, m) ||
@@ -2158,10 +2160,29 @@ static void restamb(rtk_t* rtk, const double* bias, int nb, double* xa)
 				flag = 0;
 			}
 		}
-		xa[index[0]] = rtk->x[index[0]];
+		{
+			int iref = -1, refstate;
+			double elev = -1.0;
 
-		for (i = 1; i < n[m]; i++) {
-			xa[index[i]] = xa[index[0]] - bias[nv++];
+			for (i = 0; i < n[m]; i++) {
+				int satidx = index[i] - (rtk->na + MAXSAT * f);
+				if (satidx < 0 || satidx >= MAXSAT) continue;
+				if (iref < 0 || rtk->ssat[satidx].azel[1] >= elev) {
+					iref = i;
+					elev = rtk->ssat[satidx].azel[1];
+				}
+			}
+			if (iref < 0) continue;
+			refstate = index[iref];
+			xa[refstate] = rtk->x[refstate];
+
+			for (i = 0; i < n[m]; i++) {
+				int ddidx, satidx;
+				if (i == iref) continue;
+				ddidx = nv;
+				xa[index[i]] = xa[refstate] - bias[nv++];
+				satidx = index[i] - (rtk->na + MAXSAT * f);
+			}
 		}
 	}
 	/*TEST Float Ambiguity*/
@@ -2638,14 +2659,12 @@ static int manage_amb_LAMBDA(rtk_t* rtk, double* bias, double* xa, const int* sa
 
 /* validation of solution ----------------------------------------------------*/
 static int valpos(rtk_t* rtk, const double* v, const double* R, const int* vflg,
-	int nv, double thres)
+	int nv, double thres, const char *stage)
 {
-#if 0
 	prcopt_t* opt = &rtk->opt;
-	double vv = 0.0;
-#endif
+	double *Rinv=NULL,*tmp=NULL,chi2=0.0,chi2_thres=0.0;
 	double fact = thres * thres;
-	int i, stat = 1, sat1, sat2, type, freq;
+	int i, stat = 1, sat1, sat2, type, freq, dof=nv-NP(opt), info=0;
 	char* stype;
 
 	trace(3, "valpos  : nv=%d thres=%.1f\n", nv, thres);
@@ -2661,24 +2680,67 @@ static int valpos(rtk_t* rtk, const double* v, const double* R, const int* vflg,
 		errmsg(rtk, "large residual (sat=%2d-%2d %s%d v=%6.3f sig=%.3f)\n",
 			sat1, sat2, stype, freq + 1, v[i], SQRT(R[i + i * nv]));
 	}
-#if 0 /* omitted v.2.4.0 */
-	if (stat && nv > NP(opt)) {
+	if (nv > 0) {
+		Rinv=zeros(nv,nv);
+		tmp=mat(1,nv);
+		matcpy(Rinv,R,nv,nv);
+		if (!(info=matinv(Rinv,nv))) {
+			matmul("TN",1,nv,nv,1.0,v,Rinv,0.0,tmp);
+			matmul("NN",1,1,nv,1.0,tmp,v,0.0,&chi2);
+		}
+		else {
+			errmsg(rtk, "residuals validation failed (cannot invert R, nv=%d)\n", nv);
+			stat = 0;
+		}
+		free(Rinv);
+		free(tmp);
+	}
+	rtk->sol.chi2testvalue=chi2;
+	rtk->sol.dof=dof>0?dof:0;
 
-		/* chi-square validation */
-		for (i = 0; i < nv; i++) vv += v[i] * v[i] / R[i + i * nv];
-
-		if (vv > chisqr[nv - NP(opt) - 1]) {
-			errmsg(rtk, "residuals validation failed (nv=%d np=%d vv=%.2f cs=%.2f)\n",
-				nv, NP(opt), vv, chisqr[nv - NP(opt) - 1]);
+	if (stat && dof > 0) {
+		chi2_thres=dof<=100?chisqr[dof-1]:chisqr[99];
+		if (chi2 > chi2_thres) {
+			errmsg(rtk, "residuals validation failed (nv=%d np=%d dof=%d chi2=%.2f cs=%.2f)\n",
+				nv, NP(opt), dof, chi2, chi2_thres);
 			stat = 0;
 		}
 		else {
-			trace(3, "valpos : validation ok (%s nv=%d np=%d vv=%.2f cs=%.2f)\n",
-				time_str(rtk->sol.time, 2), nv, NP(opt), vv, chisqr[nv - NP(opt) - 1]);
+			trace(3, "valpos : validation ok (%s nv=%d np=%d dof=%d chi2=%.2f cs=%.2f)\n",
+				time_str(rtk->sol.time, 2), nv, NP(opt), dof, chi2, chi2_thres);
 		}
 	}
-#endif
+	rtk_debug_valtest(rtk->sol.time,stage?stage:"unknown",rtk->sol.stat,rtk->sol.ratio,
+		nv,NP(opt),dof>0?dof:0,chi2,chi2_thres,stat,v,R,vflg,5);
 	return stat;
+}
+
+static int select_fix_valres(const rtk_t *rtk, const double *v, const double *R,
+	const int *vflg, int nv, double *vs, double *Rs, int *vflgs)
+{
+	int i, j, ns = 0, *map;
+	if (!rtk || !v || !R || !vflg || !vs || !Rs || !vflgs || nv <= 0) return 0;
+	map = imat(nv, 1);
+	if (!map) return 0;
+	for (i = 0; i < nv; i++) {
+		int sat1 = (vflg[i] >> 16) & 0xFF;
+		int sat2 = (vflg[i] >> 8) & 0xFF;
+		int type = (vflg[i] >> 4) & 0xF;
+		int frq = vflg[i] & 0xF;
+		if (type == 0) {
+			if (sat1 <= 0 || sat2 <= 0) continue;
+			if (rtk->ssat[sat1 - 1].fix[frq] < 2 || rtk->ssat[sat2 - 1].fix[frq] < 2) continue;
+		}
+		map[ns] = i;
+		vs[ns] = v[i];
+		vflgs[ns] = vflg[i];
+		ns++;
+	}
+	for (i = 0; i < ns; i++) for (j = 0; j < ns; j++) {
+		Rs[i + j * ns] = R[map[i] + map[j] * nv];
+	}
+	free(map);
+	return ns;
 }
 /* relpos()relative positioning ------------------------------------------------------
  *  args:  rtk      IO      gps solution structure
@@ -2827,11 +2889,12 @@ static int relpos(rtk_t* rtk, const obsd_t* obs, int nu, int nr,
 			errmsg(rtk, "no double-differenced residual\n");
 			stat = SOLQ_NONE;
 			rtk->sol.Ftestvalue = 0.0;
-			rtk->sol.numofnv = 0;
+			rtk->sol.chi2testvalue = 0.0;
+			rtk->sol.dof = 0;
 			break;
 		}
 #ifdef ENABLE_RTK_INTEGRITY
-		rtkint_saveddr(rtk,H,R,v,vflg,rtk->nx,nv);
+		rtkim_saveddr(rtk,H,R,v,vflg,rtk->nx,nv);
 #endif
 
 		/* kalman filter measurement update, updates x,y,z,sat phase biases, etc
@@ -2875,20 +2938,12 @@ static int relpos(rtk_t* rtk, const obsd_t* obs, int nu, int nr,
 		/* calc double diff residuals again after kalman filter update for float solution */
 		nv = ddres(rtk, nav, obs, dt, xp, Pp, sat, y, e, azel, iu, ir, ns, v, NULL, R, vflg);
 
-		/* Test the predicted dd residuals using F distribution 20241226*/
-		double* tmpF = mat(1, nv), * Ftest = mat(1, 1), * tmpR = zeros(nv, nv);
-		matcpy(tmpR, R, nv, nv);
-		if (!(info = matinv(tmpR, nv))) {
-			matmul("TN", 1, nv, nv, 1.0, v, tmpR, 0.0, tmpF);/*F=vTR-1V/nv*/
-			matmul("NN", 1, 1, nv, 1.0, tmpF, v, 0.0, Ftest);
-		}
-		rtk->sol.Ftestvalue = Ftest[0] / nv;
-		rtk->sol.numofnv = nv;
-		free(tmpF);free(Ftest);free(tmpR);
-		/* Test the posterior dd residuals using F distribution*/
+		rtk->sol.Ftestvalue = 0.0;
+		rtk->sol.chi2testvalue = 0.0;
+		rtk->sol.dof = 0;
 
-		/* validation of float solution, always returns 1, msg to trace file if large residual */
-		if (valpos(rtk, v, R, vflg, nv, 4.0)) {
+		/* validation of float solution */
+		if (valpos(rtk, v, R, vflg, nv, 4.0, "float")) {
 
 			/* update state and covariance matrix from kalman filter update */
 			matcpy(rtk->x, xp, rtk->nx, 1);
@@ -2924,15 +2979,25 @@ static int relpos(rtk_t* rtk, const obsd_t* obs, int nu, int nr,
 	else if (stat != SOLQ_NONE) {
 		/* if valid fixed solution, process it */
 		if (manage_amb_LAMBDA(rtk, bias, xa, sat, nf, ns) > 1) {
+			double *vf = NULL, *Rf = NULL;
+			int *vflgf = NULL, nvf = 0;
 
 			/* find zero-diff residuals for fixed solution */
 			if (zdres(0, obs, nu, rs, dts, var, svh, nav, xa, opt, 0, y, e, azel)) {
 
 				/* post-fit residuals for fixed solution (xa includes fixed phase biases, rtk->xa does not) */
 				nv = ddres(rtk, nav, obs, dt, xa, NULL, sat, y, e, azel, iu, ir, ns, v, NULL, R, vflg);
+				if (nv > 0) {
+					vf = mat(nv, 1);
+					Rf = mat(nv, nv);
+					vflgf = imat(nv, 1);
+				}
+				if (vf && Rf && vflgf) {
+					nvf = select_fix_valres(rtk, v, R, vflg, nv, vf, Rf, vflgf);
+				}
 
 				/* validation of fixed solution, always returns valid */
-				if (valpos(rtk, v, R, vflg, nv, 4.0)) {
+				if (nvf > 0 && valpos(rtk, vf, Rf, vflgf, nvf, 4.0, "fix")) {
 
 					/* hold integer ambiguity if meet minfix count */
 					if (rtk->sol.ratio >= rtk->sol.thres) rtk->nfix++;/*ratio >=3 ++*/
@@ -2947,10 +3012,11 @@ static int relpos(rtk_t* rtk, const obsd_t* obs, int nu, int nr,
 					}
 					stat = SOLQ_FIX;
 #ifdef ENABLE_RTK_INTEGRITY
-					rtkint_export_rbias(rtk,v,vflg,nv);
+					rtkim_export_rbias(rtk,vf,vflgf,nvf);
 #endif
 				}
 			}
+			free(vf); free(Rf); free(vflgf);
 		}
 	}
 
@@ -3068,10 +3134,10 @@ rtk->xa = zeros(rtk->na, 1);
 #ifdef ENABLE_RTK_INTEGRITY
 	rtk->int_child = 0;
 	rtk->int_reproc = 0;
-	rtk->int_fde_mode = RTKINT_F_NONE;
+	rtk->int_fde_mode = RTKIM_F_NONE;
 	rtk->int_fde_sat = 0;
 	rtk->int_hpl = rtk->int_vpl = 0.0;
-	rtkint_init(rtk, opt);
+	rtkim_init(rtk, opt);
 #endif
 }
 /* free rtk control ------------------------------------------------------------
@@ -3089,7 +3155,7 @@ trace(3, "rtkfree :\n");
 	free(rtk->xa); rtk->xa = NULL;
 	free(rtk->Pa); rtk->Pa = NULL;
 #ifdef ENABLE_RTK_INTEGRITY
-	rtkint_free(rtk);
+	rtkim_free(rtk);
 #endif
 }
 /* precise positioning ---------------------------------------------------------
@@ -3259,40 +3325,38 @@ extern int rtkpos(rtk_t* rtk, const obsd_t* obs, int n, const nav_t* nav, const 
         rtk_debug_counts(rtk,"entry",n,nu,nr);
         rtk_debug_epoch(rtk,"normal",0,0,n,n,
                         rtk->sol.stat,rtk->sol.ns,rtk->sol.ratio,
-                        rtk->sol.Ftestvalue,rr_normal);
-        rtk_debug_satset(rtk,"normal",obs,n);
+                        rtk->sol.chi2testvalue,rr_normal);
     }
 #endif
 #ifdef ENABLE_RTK_INTEGRITY
 	if (!rtk->int_child) {
-		int fde_mode=0,fde_sat=0;
-		rtkint_update(rtk, obs, n, nav, stalin);
-		if (rtk->int_reproc<=0&&rtkint_redo(rtk,&fde_mode,&fde_sat)) {
+		rtkim_detect(rtk, obs, n, nav, stalin);
+		if (rtk->int_reproc<=0&&rtk->opt.enable_rtk_integrity_fde_recovery&&
+			rtk->intg.fde.act!=RTKIM_A_NONE) {
 			obsd_t obs_fde[MAXOBS*2];
 			prcopt_t opt_save=rtk->opt;
 			int fde_pre_mode=rtk->int_fde_mode;
 			int fde_pre_sat=rtk->int_fde_sat;
+			int fde_mode=rtk->intg.fde.act;
+			int fde_sat=rtk->intg.fde.sat;
 			int fde_action=fde_mode;
 			int m=0;
             double rr_before[3]={rtk->sol.rr[0],rtk->sol.rr[1],rtk->sol.rr[2]};
             int stat_before=rtk->sol.stat;
             int ns_before=rtk->sol.ns;
             float ratio_before=rtk->sol.ratio;
-            double ftest_before=rtk->sol.Ftestvalue;
+            double ftest_before=rtk->sol.chi2testvalue;
 #if ENABLE_RTK_DEBUG_OUTPUT
             rtk_debug_epoch(rtk,"before",fde_action,fde_sat,n,n,
                             stat_before,ns_before,ratio_before,ftest_before,rr_before);
-            rtk_debug_satset(rtk,"before",obs,n);
             rtk_debug_epoch(rtk,"redo_trigger",fde_action,fde_sat,n,n,
                             stat_before,ns_before,ratio_before,ftest_before,rr_before);
 #endif
 			for (i=0;i<n;i++) {
-				if (fde_mode==RTKINT_A_SAT&&obs[i].sat==fde_sat) continue;
+				if (fde_mode==RTKIM_A_SAT&&obs[i].sat==fde_sat) continue;
 				obs_fde[m++]=obs[i];
 			}
 #if ENABLE_RTK_DEBUG_OUTPUT
-            rtk_debug_satset(rtk,"after_exclude",obs_fde,m);
-            rtk_debug_satset(rtk,"redo_satset",obs_fde,m);
 #endif
             trace(3,
                   "fde redo before: time=%s action=%d sat=%d pre_mode=%d pre_sat=%d "
@@ -3300,7 +3364,7 @@ extern int rtkpos(rtk_t* rtk, const obsd_t* obs, int n, const nav_t* nav, const 
                   time_str(rtk->sol.time,3),fde_mode,fde_sat,fde_pre_mode,fde_pre_sat,
                   stat_before,ns_before,ratio_before,ftest_before,
                   rr_before[0],rr_before[1],rr_before[2],m,n);
-			if (fde_mode==RTKINT_A_FLOAT) opt_save.modear=ARMODE_OFF;
+			if (fde_mode==RTKIM_A_FLOAT) opt_save.modear=ARMODE_OFF;
 			rtkfree(rtk);
 			rtkinit(rtk,&opt_save);
 			rtk->int_reproc=1;
@@ -3318,9 +3382,12 @@ extern int rtkpos(rtk_t* rtk, const obsd_t* obs, int n, const nav_t* nav, const 
                   "fde redo after : time=%s action=%d sat=%d stat=%d ns=%d ratio=%.3f "
                   "ftest=%.4f rr=%.4f %.4f %.4f drr=%.4f %.4f %.4f\n",
                   time_str(rtk->sol.time,3),fde_action,fde_sat,rtk->sol.stat,rtk->sol.ns,
-                  rtk->sol.ratio,rtk->sol.Ftestvalue,rtk->sol.rr[0],rtk->sol.rr[1],rtk->sol.rr[2],
+                  rtk->sol.ratio,rtk->sol.chi2testvalue,rtk->sol.rr[0],rtk->sol.rr[1],rtk->sol.rr[2],
                   rtk->sol.rr[0]-rr_before[0],rtk->sol.rr[1]-rr_before[1],rtk->sol.rr[2]-rr_before[2]);
 			rtk->int_reproc=0;
+		}
+		else {
+			rtkim_assess(rtk);
 		}
 	}
 #endif
@@ -3328,3 +3395,4 @@ extern int rtkpos(rtk_t* rtk, const obsd_t* obs, int n, const nav_t* nav, const 
 
 	return 1;
 }
+
