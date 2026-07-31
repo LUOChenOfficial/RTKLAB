@@ -91,6 +91,11 @@ static double sqvar(double covar)
 {
     return covar<0.0?-sqrt(-covar):sqrt(covar);
 }
+/* clamp ratio for solution text output -------------------------------------*/
+static double sol_ratio_out(const sol_t *sol)
+{
+    return sol->ratio>99.99?99.99:sol->ratio;
+}
 /* convert ddmm.mm in nmea format to deg -------------------------------------*/
 static double dmm2deg(double dmm)
 {
@@ -1121,6 +1126,8 @@ extern int readsolstat(char *files[], int nfile, solstatbuf_t *statbuf)
     
     return readsolstatt(files,nfile,time,time,0.0,statbuf);
 }
+static void ecef_to_output_pos(const solopt_t *opt, const double *rr_ecef, const double *rb,
+                               double *p1, double *p2, double *p3);
 /* output solution as the form of x/y/z-ecef ---------------------------------*/
 static int outecef(unsigned char *buff, const char *s, const sol_t *sol,
                    const solopt_t *opt)
@@ -1131,11 +1138,12 @@ static int outecef(unsigned char *buff, const char *s, const sol_t *sol,
     trace(3,"outecef:\n\n");
     
     //GJH0316 单差检验量好像没赋值,所以输出乱码,我直接在relpos()里赋值成0
-    p += sprintf(p, "%s%s%14.4f%s%14.4f%s%14.4f%s%3d%s%3d%s%8.4f%s%8.4f%s%8.4f%s%8.4f%s%8.4f%s%8.4f%s%6.2f%s%6.1f",
+    p += sprintf(p, "%s%s%14.4f%s%14.4f%s%14.4f%s%3d%s%3d%s%8.4f%s%8.4f%s%8.4f%s%8.4f%s%8.4f%s%8.4f%s%6.2f%s%6.1f%s%11.4f%s%12.4f%s%14.4f%s%14.4f%s%14.4f",
         s, sep, sol->rr[0], sep, sol->rr[1], sep, sol->rr[2], sep, sol->stat, sep,
         sol->ns, sep, SQRT(sol->qr[0]), sep, SQRT(sol->qr[1]), sep, SQRT(sol->qr[2]),
         sep, sqvar(sol->qr[3]), sep, sqvar(sol->qr[4]), sep, sqvar(sol->qr[5]),
-        sep, sol->age, sep, sol->ratio);//, sep, sol->test_sd, sep,sol->test_dd,sep, sol->Ftestvalue,sep,sol->numofnv);
+        sep, sol->age, sep, sol_ratio_out(sol), sep, sol->rms_pr, sep, sol->rms_cp,
+        sep, sol->rr_flt[0], sep, sol->rr_flt[1], sep, sol->rr_flt[2]);//, sep, sol->test_sd, sep,sol->test_dd,sep, sol->Ftestvalue,sep,sol->numofnv);
 
     /*
     for (int i = 0;i < 12;i++) {
@@ -1158,7 +1166,7 @@ static int outecef(unsigned char *buff, const char *s, const sol_t *sol,
 static int outpos(unsigned char *buff, const char *s, const sol_t *sol,
                   const solopt_t *opt)
 {
-    double pos[3],vel[3],dms1[3],dms2[3],P[9],Q[9];
+    double pos[3],vel[3],dms1[3],dms2[3],P[9],Q[9],f1,f2,f3;
     const char *sep=opt2sep(opt);
     char *p=(char *)buff;
     
@@ -1180,10 +1188,12 @@ static int outpos(unsigned char *buff, const char *s, const sol_t *sol,
     else {
         p+=sprintf(p,"%s%s%14.9f%s%14.9f",s,sep,pos[0]*R2D,sep,pos[1]*R2D);
     }
-    p+=sprintf(p,"%s%10.4f%s%3d%s%3d%s%8.4f%s%8.4f%s%8.4f%s%8.4f%s%8.4f%s%8.4f%s%6.2f%s%6.1f",
+    ecef_to_output_pos(opt,sol->rr_flt,NULL,&f1,&f2,&f3);
+    p+=sprintf(p,"%s%10.4f%s%3d%s%3d%s%8.4f%s%8.4f%s%8.4f%s%8.4f%s%8.4f%s%8.4f%s%6.2f%s%6.1f%s%11.4f%s%12.4f%s%14.9f%s%14.9f%s%10.4f",
                sep,pos[2],sep,sol->stat,sep,sol->ns,sep,SQRT(Q[4]),sep,
                SQRT(Q[0]),sep,SQRT(Q[8]),sep,sqvar(Q[1]),sep,sqvar(Q[2]),
-               sep,sqvar(Q[5]),sep,sol->age,sep,sol->ratio);
+               sep,sqvar(Q[5]),sep,sol->age,sep,sol_ratio_out(sol),sep,sol->rms_pr,
+               sep,sol->rms_cp,sep,f1,sep,f2,sep,f3);
     
     if (opt->outvel) { /* output velocity */
         soltocov_vel(sol,P);
@@ -1201,7 +1211,7 @@ static int outpos(unsigned char *buff, const char *s, const sol_t *sol,
 static int outenu(unsigned char *buff, const char *s, const sol_t *sol,
                   const double *rb, const solopt_t *opt)
 {
-    double pos[3],vel[3],rr[3],enu[3],P[9],Q[9];
+    double pos[3],vel[3],rr[3],enu[3],P[9],Q[9],f1,f2,f3;
     int i;
     const char *sep=opt2sep(opt);
     char *p=(char *)buff;
@@ -1213,10 +1223,12 @@ static int outenu(unsigned char *buff, const char *s, const sol_t *sol,
     soltocov(sol,P);
     covenu(pos,P,Q);
     ecef2enu(pos,rr,enu);
-    p+=sprintf(p,"%s%s%14.4f%s%14.4f%s%14.4f%s%3d%s%3d%s%8.4f%s%8.4f%s%8.4f%s%8.4f%s%8.4f%s%8.4f%s%6.2f%s%6.1f",
+    ecef_to_output_pos(opt,sol->rr_flt,rb,&f1,&f2,&f3);
+    p+=sprintf(p,"%s%s%14.4f%s%14.4f%s%14.4f%s%3d%s%3d%s%8.4f%s%8.4f%s%8.4f%s%8.4f%s%8.4f%s%8.4f%s%6.2f%s%6.1f%s%11.4f%s%12.4f%s%14.4f%s%14.4f%s%14.4f",
                s,sep,enu[0],sep,enu[1],sep,enu[2],sep,sol->stat,sep,sol->ns,sep,
                SQRT(Q[0]),sep,SQRT(Q[4]),sep,SQRT(Q[8]),sep,sqvar(Q[1]),
-               sep,sqvar(Q[5]),sep,sqvar(Q[2]),sep,sol->age,sep,sol->ratio);
+               sep,sqvar(Q[5]),sep,sqvar(Q[2]),sep,sol->age,sep,sol_ratio_out(sol),
+               sep,sol->rms_pr,sep,sol->rms_cp,sep,f1,sep,f2,sep,f3);
     if (opt->outvel) { /* output velocity */
         soltocov_vel(sol,P);
         ecef2enu(pos,sol->rr+3,vel);
@@ -1228,6 +1240,34 @@ static int outenu(unsigned char *buff, const char *s, const sol_t *sol,
     }
     p+=sprintf(p,"\n");
     return p-(char *)buff;
+}
+
+static void ecef_to_output_pos(const solopt_t *opt, const double *rr_ecef, const double *rb,
+                               double *p1, double *p2, double *p3)
+{
+    double pos[3], rr[3], enu[3];
+    int i;
+
+    if (opt->posf==SOLF_XYZ) {
+        *p1=rr_ecef[0];
+        *p2=rr_ecef[1];
+        *p3=rr_ecef[2];
+        return;
+    }
+    if (opt->posf==SOLF_ENU) {
+        for (i=0;i<3;i++) rr[i]=rr_ecef[i]-rb[i];
+        ecef2pos(rb,pos);
+        ecef2enu(pos,rr,enu);
+        *p1=enu[0];
+        *p2=enu[1];
+        *p3=enu[2];
+        return;
+    }
+    ecef2pos(rr_ecef,pos);
+    if (opt->height==1) pos[2]-=geoidh(pos);
+    *p1=pos[0]*R2D;
+    *p2=pos[1]*R2D;
+    *p3=pos[2];
 }
 /* output solution in the form of nmea RMC sentence --------------------------*/
 extern int outnmea_rmc(unsigned char *buff, const sol_t *sol)
@@ -1575,16 +1615,18 @@ extern int outsolheads(unsigned char *buff, const solopt_t *opt)
     
     if (opt->posf==SOLF_LLH) { /* lat/lon/hgt */
         if (opt->degf) {
-            p+=sprintf(p,"%16s%s%16s%s%10s%s%3s%s%3s%s%8s%s%8s%s%8s%s%8s%s%8s%s%8s%s%6s%s%6s",
+            p+=sprintf(p,"%16s%s%16s%s%10s%s%3s%s%3s%s%8s%s%8s%s%8s%s%8s%s%8s%s%8s%s%6s%s%6s%s%11s%s%12s%s%14s%s%14s%s%10s",
                        "latitude(d'\")",sep,"longitude(d'\")",sep,"height(m)",sep,
                        "Q",sep,"ns",sep,"sdn(m)",sep,"sde(m)",sep,"sdu(m)",sep,
-                       "sdne(m)",sep,"sdeu(m)",sep,"sdue(m)",sep,"age(s)",sep,"ratio");
+                       "sdne(m)",sep,"sdeu(m)",sep,"sdue(m)",sep,"age(s)",sep,"ratio",
+                       sep,"rms_pr(m)",sep,"rms_cp(m)",sep,"float_lat(deg)",sep,"float_lon(deg)",sep,"float_hgt(m)");
         }
         else {
-            p+=sprintf(p,"%14s%s%14s%s%10s%s%3s%s%3s%s%8s%s%8s%s%8s%s%8s%s%8s%s%8s%s%6s%s%6s",
+            p+=sprintf(p,"%14s%s%14s%s%10s%s%3s%s%3s%s%8s%s%8s%s%8s%s%8s%s%8s%s%8s%s%6s%s%6s%s%11s%s%12s%s%14s%s%14s%s%10s",
                        "latitude(deg)",sep,"longitude(deg)",sep,"height(m)",sep,
                        "Q",sep,"ns",sep,"sdn(m)",sep,"sde(m)",sep,"sdu(m)",sep,
-                       "sdne(m)",sep,"sdeu(m)",sep,"sdun(m)",sep,"age(s)",sep,"ratio");
+                       "sdne(m)",sep,"sdeu(m)",sep,"sdun(m)",sep,"age(s)",sep,"ratio",
+                       sep,"rms_pr(m)",sep,"rms_cp(m)",sep,"float_lat(deg)",sep,"float_lon(deg)",sep,"float_hgt(m)");
         }
         if (opt->outvel) {
             p+=sprintf(p,"%s%10s%s%10s%s%10s%s%9s%s%8s%s%8s%s%8s%s%8s%s%8s",
@@ -1593,10 +1635,11 @@ extern int outsolheads(unsigned char *buff, const solopt_t *opt)
         }
     }
     else if (opt->posf==SOLF_XYZ) { /* x/y/z-ecef */
-        p+=sprintf(p,"%14s%s%14s%s%14s%s%3s%s%3s%s%8s%s%8s%s%8s%s%8s%s%8s%s%8s%s%6s%s%6s",
+        p+=sprintf(p,"%14s%s%14s%s%14s%s%3s%s%3s%s%8s%s%8s%s%8s%s%8s%s%8s%s%8s%s%6s%s%6s%s%11s%s%12s%s%14s%s%14s%s%14s",
                    "x-ecef(m)",sep,"y-ecef(m)",sep,"z-ecef(m)",sep,"Q",sep,"ns",sep,
                    "sdx(m)",sep,"sdy(m)",sep,"sdz(m)",sep,"sdxy(m)",sep,
-                   "sdyz(m)",sep,"sdzx(m)",sep,"age(s)",sep,"ratio");
+                   "sdyz(m)",sep,"sdzx(m)",sep,"age(s)",sep,"ratio",
+                   sep,"rms_pr(m)",sep,"rms_cp(m)",sep,"float_x(m)",sep,"float_y(m)",sep,"float_z(m)");
         
         if (opt->outvel) {
             p+=sprintf(p,"%s%10s%s%10s%s%10s%s%9s%s%8s%s%8s%s%8s%s%8s%s%8s",
@@ -1605,10 +1648,11 @@ extern int outsolheads(unsigned char *buff, const solopt_t *opt)
         }
     }
     else if (opt->posf==SOLF_ENU) { /* e/n/u-baseline */
-        p+=sprintf(p,"%14s%s%14s%s%14s%s%3s%s%3s%s%8s%s%8s%s%8s%s%8s%s%8s%s%8s%s%6s%s%6s",
+        p+=sprintf(p,"%14s%s%14s%s%14s%s%3s%s%3s%s%8s%s%8s%s%8s%s%8s%s%8s%s%8s%s%6s%s%6s%s%11s%s%12s%s%14s%s%14s%s%14s",
                    "e-baseline(m)",sep,"n-baseline(m)",sep,"u-baseline(m)",sep,
                    "Q",sep,"ns",sep,"sde(m)",sep,"sdn(m)",sep,"sdu(m)",sep,
-                   "sden(m)",sep,"sdnu(m)",sep,"sdue(m)",sep,"age(s)",sep,"ratio");
+                   "sden(m)",sep,"sdnu(m)",sep,"sdue(m)",sep,"age(s)",sep,"ratio",
+                   sep,"rms_pr(m)",sep,"rms_cp(m)",sep,"float_e(m)",sep,"float_n(m)",sep,"float_u(m)");
         if (opt->outvel) {
             p+=sprintf(p,"%s%10s%s%10s%s%10s%s%9s%s%8s%s%8s%s%8s%s%8s%s%8s",
                        sep,"ve(m/s)",sep,"vn(m/s)",sep,"vu(m/s)",sep,"sdve",sep,

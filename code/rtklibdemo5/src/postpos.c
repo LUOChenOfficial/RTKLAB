@@ -41,6 +41,8 @@
 *           2017/06/13  1.23 add smoother of velocity solution
 *-----------------------------------------------------------------------------*/
 #include "rtklib.h"
+#include <errno.h>
+#include <sys/stat.h>
 
 #define MIN(x,y)    ((x)<(y)?(x):(y))
 #define SQRT(x)     ((x)<=0.0||(x)!=(x)?0.0:sqrt(x))
@@ -79,6 +81,59 @@ static char rtcm_path[1024]=""; /* rtcm data path */
 static gtime_t invalidtm[100]={{0}};/* invalid time marks */
 static rtcm_t rtcm;             /* rtcm control struct */
 static FILE *fp_rtcm=NULL;      /* rtcm data file pointer */
+
+/* create local directory recursively ---------------------------------------*/
+static int mkdir_r_local(const char *dir)
+{
+    char pdir[1024],*p;
+#ifdef WIN32
+    HANDLE h;
+    WIN32_FIND_DATA data;
+
+    if (!*dir||!strcmp(dir+1,":\\")) return 1;
+
+    strcpy(pdir,dir);
+    if ((p=strrchr(pdir,FILEPATHSEP))) {
+        *p='\0';
+        h=FindFirstFile(pdir,&data);
+        if (h==INVALID_HANDLE_VALUE) {
+            if (!mkdir_r_local(pdir)) return 0;
+        }
+        else FindClose(h);
+    }
+    if (CreateDirectory(dir,NULL)||
+        GetLastError()==ERROR_ALREADY_EXISTS) return 1;
+#else
+    FILE *fp;
+
+    if (!*dir) return 1;
+
+    strcpy(pdir,dir);
+    if ((p=strrchr(pdir,FILEPATHSEP))) {
+        *p='\0';
+        if (!(fp=fopen(pdir,"r"))) {
+            if (!mkdir_r_local(pdir)) return 0;
+        }
+        else fclose(fp);
+    }
+    if (!mkdir(dir,0777)||errno==EEXIST) return 1;
+#endif
+    trace(2,"directory generation error: dir=%s\n",dir);
+    return 0;
+}
+
+/* ensure parent directory exists -------------------------------------------*/
+static void ensure_parent_dir(const char *path)
+{
+    char dir[1024],*p;
+
+    if (!path||!*path) return;
+    strcpy(dir,path);
+    if (!(p=strrchr(dir,FILEPATHSEP))) return;
+    *p='\0';
+    if (!*dir) return;
+    mkdir_r_local(dir);
+}
 
 #if ENABLE_RTK_SKIP_EPOCH
 static int skip_epoch_applied = 0;
@@ -1128,7 +1183,8 @@ static int outhead(const char *outfile, char **infile, int n,
 static FILE *openfile(const char *outfile)
 {
     trace(3,"openfile: outfile=%s\n",outfile);
-    
+
+    if (*outfile) ensure_parent_dir(outfile);
     return !*outfile?stdout:fopen(outfile,"w");
 }
 /* Name time marks file ------------------------------------------------------*/
@@ -1154,7 +1210,7 @@ static int execses(gtime_t ts, gtime_t te, double ti, const prcopt_t *popt,
                    char **infile, const int *index, int n, char *outfile)
 {
     FILE *fp,*fptm;
-    rtk_t rtk;
+    rtk_t rtk={0};
     prcopt_t popt_=*popt;
     solopt_t tmsopt = *sopt;
     char tracefile[1024],statfile[1024],path[1024],*ext,outfiletm[1024]={0};

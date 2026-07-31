@@ -4,9 +4,6 @@
 
 #define SQR_(x)      ((x)*(x))
 #define SQRT_(x)     ((x)<=0.0||(x)!=(x)?0.0:sqrt(x))
-#define K_MAIN       5.33
-#define K_SUB        5.33
-#define K_SS         5.10
 #define NF_(opt)     ((opt)->ionoopt==IONOOPT_IFLC?1:(opt)->nf)
 #define NP_(opt)     ((opt)->dynamics==0?3:9)
 #define NI_(opt)     ((opt)->ionoopt!=IONOOPT_EST?0:MAXSAT)
@@ -14,6 +11,8 @@
 #define NL_(opt)     ((opt)->glomodear!=GLO_ARMODE_AUTOCAL?0:NFREQGLO)
 #define NR_(opt)     (NP_(opt)+NI_(opt)+NT_(opt)+NL_(opt))
 #define IB_(s,f,opt) (NR_(opt)+MAXSAT*(f)+(s)-1)
+#define RTKINT_DEFAULT_PFA 1e-6
+#define RTKINT_DEFAULT_PMD 5e-8
 
 static FILE *fp_pint=NULL,*fp_pld=NULL,*fp_sub=NULL,*fp_rbias=NULL;
 #if ENABLE_RTK_DEBUG_OUTPUT
@@ -22,6 +21,72 @@ static FILE *fp_vtest_dbg=NULL;
 #endif
 static int out_sub=0,out_rbias=0;
 static char rbias_path_hint[1024]="";
+
+#if ENABLE_RTK_ARAIM_PL_BIAS_TERM
+static int calcbiasenu(rtk_t *rtk, double *be, double *bn, double *bu, int *rows);
+#endif
+
+static double clamp_prob(double p, double def)
+{
+    return p>0.0&&p<1.0?p:def;
+}
+
+static double norminv(double p)
+{
+    static const double a[]={
+        -3.969683028665376e+01, 2.209460984245205e+02,
+        -2.759285104469687e+02, 1.383577518672690e+02,
+        -3.066479806614716e+01, 2.506628277459239e+00
+    };
+    static const double b[]={
+        -5.447609879822406e+01, 1.615858368580409e+02,
+        -1.556989798598866e+02, 6.680131188771972e+01,
+        -1.328068155288572e+01
+    };
+    static const double c[]={
+        -7.784894002430293e-03, -3.223964580411365e-01,
+        -2.400758277161838e+00, -2.549732539343734e+00,
+        4.374664141464968e+00, 2.938163982698783e+00
+    };
+    static const double d[]={
+        7.784695709041462e-03, 3.224671290700398e-01,
+        2.445134137142996e+00, 3.754408661907416e+00
+    };
+    double q,r;
+    if (p<=0.0) return -1E9;
+    if (p>=1.0) return 1E9;
+    if (p<0.02425) {
+        q=sqrt(-2.0*log(p));
+        return (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5])/
+               ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1.0);
+    }
+    if (p>1.0-0.02425) {
+        q=sqrt(-2.0*log(1.0-p));
+        return -(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5])/
+                ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1.0);
+    }
+    q=p-0.5;
+    r=q*q;
+    return (((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r+a[5])*q/
+           ((((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r)+1.0);
+}
+
+static void integrity_thresholds(const prcopt_t *opt, int nset,
+                                 double *kmain, double *ksub, double *kss)
+{
+    double pfa=clamp_prob(opt?opt->rtk_integrity_false_alarm_prob:0.0,
+                          RTKINT_DEFAULT_PFA);
+    double pmd=clamp_prob(opt?opt->rtk_integrity_miss_detect_prob:0.0,
+                          RTKINT_DEFAULT_PMD);
+    double kfa=norminv(1.0-pfa*0.5);
+    double kmd=norminv(1.0-pmd*0.5);
+    double kss_pfa;
+    if (nset<=0) nset=1;
+    kss_pfa=clamp_prob(pfa/(4.0*nset),RTKINT_DEFAULT_PFA/4.0);
+    if (kmain) *kmain=kfa;
+    if (ksub)  *ksub =kmd;
+    if (kss)   *kss  =norminv(1.0-kss_pfa);
+}
 
 #if ENABLE_RTK_ARAIM_PL_BIAS_TERM
 typedef struct {
@@ -52,6 +117,329 @@ static void sepenu(const double *base, const double *pos, double *sep)
     ecef2pos(base,llh);
     xyz2enu(llh,E);
     matmul("NN",3,1,3,1.0,E,bl,0.0,sep);
+}
+
+static void qr2cov(const float *qr, double *q)
+{
+    q[0]=qr[0]; q[1]=qr[1]; q[2]=qr[2];
+    q[3]=qr[3]; q[4]=qr[4]; q[5]=qr[5];
+}
+
+static int satfromvflg(int vflg)
+{
+    int su=(vflg>>8)&0xFF;
+    int sf=(vflg>>16)&0xFF;
+    return su>0?su:sf;
+}
+
+static int satinrow(int vflg, int sat)
+{
+    int su=(vflg>>8)&0xFF;
+    int sf=(vflg>>16)&0xFF;
+    return sat>0&&(su==sat||sf==sat);
+}
+
+static int lsq_dd_model(const rtk_t *rtk, int excl_sat, double *qecef,
+                        double *sigenu_out, double *xenu, int *nrow)
+{
+    const rtkim_t *mon=&rtk->intg;
+    double pos[3],E[9],qtmp[6],*Hpos=NULL,*Rsub=NULL,*W=NULL,*F=NULL,*N=NULL,*u=NULL,*vsub=NULL;
+    int i,j,m=0,*rows=NULL,ok=0;
+
+    if (nrow) *nrow=0;
+    if (xenu) memset(xenu,0,sizeof(double)*3);
+    if (sigenu_out) memset(sigenu_out,0,sizeof(double)*3);
+    if (qecef) memset(qecef,0,sizeof(double)*9);
+    if (!mon->bH||!mon->bR||!mon->bv||mon->bnv<=0||mon->bnx<3) return 0;
+
+    rows=(int *)malloc(sizeof(int)*mon->bnv);
+    if (!rows) return 0;
+    for (i=0;i<mon->bnv;i++) {
+        if (satinrow(mon->bflg[i],excl_sat)) continue;
+        rows[m++]=i;
+    }
+    if (nrow) *nrow=m;
+    if (m<3) {
+        free(rows);
+        return 0;
+    }
+    Hpos=mat(3,m);
+    Rsub=mat(m,m);
+    W=mat(m,m);
+    F=mat(3,m);
+    N=mat(3,3);
+    u=mat(3,1);
+    vsub=mat(m,1);
+    if (!Hpos||!Rsub||!W||!F||!N||!u||!vsub) {
+        free(rows);
+        free(Hpos); free(Rsub); free(W); free(F); free(N); free(u); free(vsub);
+        return 0;
+    }
+    for (j=0;j<m;j++) {
+        int rj=rows[j];
+        vsub[j]=mon->bv[rj];
+        for (i=0;i<3;i++) Hpos[i+j*3]=mon->bH[i+rj*mon->bnx];
+        for (i=0;i<m;i++) Rsub[i+j*m]=mon->bR[rows[i]+rj*mon->bnv];
+    }
+    matcpy(W,Rsub,m,m);
+    if (matinv(W,m)) {
+        goto done;
+    }
+    matmul("NN",3,m,m,1.0,Hpos,W,0.0,F);
+    matmul("NT",3,3,m,1.0,F,Hpos,0.0,N);
+    if (matinv(N,3)) {
+        goto done;
+    }
+    for (i=0;i<3;i++) {
+        u[i]=0.0;
+        for (j=0;j<m;j++) u[i]+=F[i+j*3]*vsub[j];
+    }
+    if (xenu||qecef||sigenu_out) {
+        double xecef[3]={0};
+        for (i=0;i<3;i++) {
+            for (j=0;j<3;j++) xecef[i]+=N[i+j*3]*u[j];
+        }
+        if (qecef) {
+            for (i=0;i<9;i++) qecef[i]=N[i];
+        }
+        qtmp[0]=N[0];
+        qtmp[1]=N[4];
+        qtmp[2]=N[8];
+        qtmp[3]=N[1];
+        qtmp[4]=N[5];
+        qtmp[5]=N[2];
+        if (sigenu_out) sigenu(rtk->sol.rr,qtmp,sigenu_out);
+        if (xenu) {
+            ecef2pos(rtk->sol.rr,pos);
+            xyz2enu(pos,E);
+            for (i=0;i<3;i++) {
+                for (j=0;j<3;j++) xenu[i]+=E[i+j*3]*xecef[j];
+            }
+        }
+    }
+    ok=1;
+done:
+    free(rows);
+    free(Hpos); free(Rsub); free(W); free(F); free(N); free(u); free(vsub);
+    return ok;
+}
+
+static int build_ls_subsets(rtk_t *rtk, double *msig_out, double *mainenu_out)
+{
+    rtkim_t *mon=&rtk->intg;
+    double msig[3]={0},mainenu[3]={0};
+    int i,k,nrow=0,nvalid=0;
+
+    if (msig_out) memset(msig_out,0,sizeof(double)*3);
+    if (mainenu_out) memset(mainenu_out,0,sizeof(double)*3);
+    mon->nact=0;
+    for (i=0;i<mon->ndef;i++) memset(&mon->ss[i],0,sizeof(mon->ss[i]));
+    if (!lsq_dd_model(rtk,0,NULL,msig,mainenu,&nrow)) return 0;
+    if (msig_out) for (i=0;i<3;i++) msig_out[i]=msig[i];
+    if (mainenu_out) for (i=0;i<3;i++) mainenu_out[i]=mainenu[i];
+
+    for (i=0;i<mon->ndef;i++) {
+        rtkim_def_t *def=mon->def+i;
+        rtkim_ss_t *ss=mon->ss+i;
+        double ssig[3]={0},subenu[3]={0};
+        if (def->mode!=RTKIM_F_SAT||def->sat<=0) continue;
+        ss->act=1;
+        if (!lsq_dd_model(rtk,def->sat,NULL,ssig,subenu,&nrow)) continue;
+        ss->ready=1;
+        ss->valid=1;
+        ss->qi=rtk->sol.stat;
+        ss->ratio=rtk->sol.ratio;
+        for (k=0;k<3;k++) {
+            ss->sig[k]=ssig[k];
+            ss->sep[k]=mainenu[k]-subenu[k];
+        }
+        nvalid++;
+    }
+    mon->nact=nvalid;
+    return 1;
+}
+
+static void calcpl_slope(rtk_t *rtk)
+{
+    rtkim_t *mon=&rtk->intg;
+    rtkim_pl_t *pl=&mon->pl;
+    double qmain[6],msig[3],kmain=0.0,ksub=0.0,kss=0.0;
+    double P[9],pos[3],E[9],*F=NULL,*Q=NULL,*Qinv=NULL,*Kecef=NULL,*Kenu=NULL,*A=NULL,*S=NULL;
+    double hsmax=0.0,vsmax=0.0,pbias=0.0,sigmab=0.0;
+    int i,j,k,n=mon->bnv,ih=-1,iv=-1;
+
+    memset(pl,0,sizeof(*pl));
+    if (n<=0||!mon->bH||!mon->bR||!rtk->x||!rtk->P||rtk->nx<3) {
+        rtk->int_hpl=0.0;
+        rtk->int_vpl=0.0;
+        return;
+    }
+    integrity_thresholds(&rtk->opt,n,&kmain,&ksub,&kss);
+    qmain[0]=rtk->P[0];
+    qmain[1]=rtk->P[1+rtk->nx];
+    qmain[2]=rtk->P[2+2*rtk->nx];
+    qmain[3]=rtk->P[1];
+    qmain[4]=rtk->P[2+rtk->nx];
+    qmain[5]=rtk->P[2];
+    sigenu(rtk->x,qmain,msig);
+    for (i=0;i<3;i++) pl->msig[i]=msig[i];
+
+    P[0]=rtk->P[0];             P[1]=rtk->P[1];             P[2]=rtk->P[2];
+    P[3]=rtk->P[rtk->nx];       P[4]=rtk->P[1+rtk->nx];     P[5]=rtk->P[2+rtk->nx];
+    P[6]=rtk->P[2*rtk->nx];     P[7]=rtk->P[1+2*rtk->nx];   P[8]=rtk->P[2+2*rtk->nx];
+
+    ecef2pos(rtk->x,pos);
+    xyz2enu(pos,E);
+
+    F=mat(3,n);
+    Q=mat(n,n);
+    Qinv=mat(n,n);
+    Kecef=mat(3,n);
+    Kenu=mat(3,n);
+    A=eye(n);
+    S=mat(n,n);
+    if (!F||!Q||!Qinv||!Kecef||!Kenu||!A||!S) {
+        free(F); free(Q); free(Qinv); free(Kecef); free(Kenu); free(A); free(S);
+        rtk->int_hpl=0.0;
+        rtk->int_vpl=0.0;
+        return;
+    }
+    for (j=0;j<n;j++) {
+        for (i=0;i<3;i++) {
+            F[i+j*3]=0.0;
+            for (k=0;k<3;k++) F[i+j*3]+=P[i+k*3]*mon->bH[k+j*mon->bnx];
+        }
+    }
+    for (j=0;j<n;j++) for (i=0;i<n;i++) {
+        double s=mon->bR[i+j*n];
+        for (k=0;k<3;k++) s+=mon->bH[k+i*mon->bnx]*F[k+j*3];
+        Q[i+j*n]=s;
+    }
+    matcpy(Qinv,Q,n,n);
+    if (!matinv(Qinv,n)) {
+        matmul("NN",3,n,n,1.0,F,Qinv,0.0,Kecef);
+        for (j=0;j<n;j++) {
+            for (i=0;i<3;i++) {
+                Kenu[i+j*3]=0.0;
+                for (k=0;k<3;k++) Kenu[i+j*3]+=E[i+k*3]*Kecef[k+j*3];
+            }
+        }
+        for (j=0;j<n;j++) for (i=0;i<n;i++) {
+            double hk=0.0;
+            for (k=0;k<3;k++) hk+=mon->bH[k+i*mon->bnx]*Kecef[k+j*3];
+            A[i+j*n]-=hk;
+        }
+        matmul("TN",n,n,n,1.0,A,A,0.0,S);
+        for (j=0;j<n;j++) {
+            double sii=S[j+j*n],hs,vs;
+            if (sii<=0.0) continue;
+            hs=SQRT_(SQR_(Kenu[0+j*3])+SQR_(Kenu[1+j*3]))/sqrt(sii);
+            vs=fabs(Kenu[2+j*3])/sqrt(sii);
+            if (hs>hsmax) {
+                hsmax=hs;
+                ih=j;
+            }
+            if (vs>vsmax) {
+                vsmax=vs;
+                iv=j;
+            }
+        }
+        if (ih>=0) {
+            for (j=0;j<n;j++) sigmab+=mon->bR[ih+j*n];
+            sigmab=SQRT_(fabs(sigmab));
+            pbias=kss*sigmab;
+            pl->hsrc=ih+1;
+            pl->hsat=satfromvflg(mon->bflg[ih]);
+            pl->hmode=RTKIM_F_SAT;
+        }
+        if (iv>=0) {
+            pl->vsrc=iv+1;
+            pl->vsat=satfromvflg(mon->bflg[iv]);
+            pl->vmode=RTKIM_F_SAT;
+        }
+        pl->hpl0=hsmax*pbias;
+        pl->vpl0=vsmax*pbias;
+    }
+    free(F); free(Q); free(Qinv); free(Kecef); free(Kenu); free(A); free(S);
+    pl->pe=pl->hpl0;
+    pl->pn=0.0;
+    pl->pu=pl->vpl0;
+    pl->hpl=pl->hpl0;
+    pl->vpl=pl->vpl0;
+    pl->hadd=pl->hpl-pl->hpl0;
+    pl->vadd=pl->vpl-pl->vpl0;
+    rtk->int_hpl=pl->hpl;
+    rtk->int_vpl=pl->vpl;
+}
+
+static void calcpl_ls(rtk_t *rtk)
+{
+    rtkim_t *mon=&rtk->intg;
+    rtkim_pl_t *pl=&mon->pl;
+    double msig[3],ssig[3],sep[3];
+    double pe,pn,pu,sss,subp,kmain=0.0,ksub=0.0,kss=0.0;
+    int i,k;
+
+    memset(pl,0,sizeof(*pl));
+    if (rtk->sol.stat!=SOLQ_FIX) {
+        rtk->int_hpl=0.0;
+        rtk->int_vpl=0.0;
+        return;
+    }
+    if (!build_ls_subsets(rtk,msig,NULL)) {
+        rtk->int_hpl=0.0;
+        rtk->int_vpl=0.0;
+        return;
+    }
+    integrity_thresholds(&rtk->opt,mon->ndef,&kmain,&ksub,&kss);
+    for (i=0;i<3;i++) pl->msig[i]=msig[i];
+    pe=kmain*msig[0];
+    pn=kmain*msig[1];
+    pu=kmain*msig[2];
+    pl->hsrc=pl->vsrc=0;
+
+    for (i=0;i<mon->ndef;i++) {
+        rtkim_def_t *def=mon->def+i;
+        rtkim_ss_t *ss=mon->ss+i;
+        if (!ss->act||!ss->valid||def->mode!=RTKIM_F_SAT||def->sat<=0) continue;
+        for (k=0;k<3;k++) {
+            ssig[k]=ss->sig[k];
+            sep[k]=ss->sep[k];
+        }
+        for (k=0;k<3;k++) {
+            sss=SQRT_(fabs(SQR_(ssig[k])-SQR_(msig[k])));
+            subp=ksub*ssig[k]+kss*sss;
+            if (k==0&&subp>pe) {
+                pe=subp; pl->hsrc=def->id; pl->hmode=def->mode; pl->hsat=def->sat;
+                pl->hsig[0]=ssig[0]; pl->hsig[1]=ssig[1]; pl->hsig[2]=ssig[2];
+                pl->hsss[0]=sss; pl->hsss[1]=0.0; pl->hsss[2]=0.0;
+                pl->hsep[0]=sep[0]; pl->hsep[1]=sep[1]; pl->hsep[2]=sep[2];
+            }
+            if (k==1&&subp>pn) {
+                pn=subp; pl->hsrc=def->id; pl->hmode=def->mode; pl->hsat=def->sat;
+                pl->hsig[0]=ssig[0]; pl->hsig[1]=ssig[1]; pl->hsig[2]=ssig[2];
+                pl->hsss[0]=0.0; pl->hsss[1]=sss; pl->hsss[2]=0.0;
+                pl->hsep[0]=sep[0]; pl->hsep[1]=sep[1]; pl->hsep[2]=sep[2];
+            }
+            if (k==2&&subp>pu) {
+                pu=subp; pl->vsrc=def->id; pl->vmode=def->mode; pl->vsat=def->sat;
+                pl->vsig[0]=ssig[0]; pl->vsig[1]=ssig[1]; pl->vsig[2]=ssig[2];
+                pl->vsss[0]=0.0; pl->vsss[1]=0.0; pl->vsss[2]=sss;
+                pl->vsep[0]=sep[0]; pl->vsep[1]=sep[1]; pl->vsep[2]=sep[2];
+            }
+        }
+    }
+    pl->pe=pe;
+    pl->pn=pn;
+    pl->pu=pu;
+    pl->hpl0=SQRT_(SQR_(pe)+SQR_(pn));
+    pl->vpl0=pu;
+    pl->hpl=pl->hpl0;
+    pl->vpl=pl->vpl0;
+    pl->hadd=0.0;
+    pl->vadd=0.0;
+    rtk->int_hpl=pl->hpl;
+    rtk->int_vpl=pl->vpl;
 }
 
 static void setpath(char *dst, const char *src, const char *ext)
@@ -473,12 +861,21 @@ static void runsub(rtk_t *rtk, int idx, const obsd_t *obs, int n,
 
 static void calcpl(rtk_t *rtk)
 {
+#if RTK_INT_METHOD==RTK_INT_METHOD_SLOPE
+    calcpl_slope(rtk);
+    return;
+#elif RTK_INT_METHOD==RTK_INT_METHOD_LS_SS
+    calcpl_ls(rtk);
+    return;
+#else
     rtkim_t *mon=&rtk->intg;
     rtkim_pl_t *pl=&mon->pl;
-    double msig[3],pe,pn,pu,ssig[3],sss,subp,qmain[6];
+    double msig[3],pe,pn,pu,ssig[3],qmain[6];
+    double kmain,ksub,kss;
     double be=0.0,bn=0.0,bu=0.0;
+    double hpl0;
     int brows=0;
-    int i,k;
+    int i;
 
     memset(pl,0,sizeof(*pl));
     if (rtk->sol.stat==SOLQ_NONE) {
@@ -487,37 +884,43 @@ static void calcpl(rtk_t *rtk)
         return;
     }
     for (i=0;i<6;i++) qmain[i]=rtk->sol.qr[i];
+    integrity_thresholds(&rtk->opt,mon->ndef,&kmain,&ksub,&kss);
     sigenu(rtk->sol.rr,qmain,msig);
     for (i=0;i<3;i++) pl->msig[i]=msig[i];
-    pe=K_MAIN*msig[0]; pn=K_MAIN*msig[1]; pu=K_MAIN*msig[2];
+    pe=kmain*msig[0]; pn=kmain*msig[1]; pu=kmain*msig[2];
+    hpl0=SQRT_(SQR_(pe)+SQR_(pn));
     pl->hsrc=pl->vsrc=0;
     for (i=0;i<mon->ndef;i++) {
         rtkim_ss_t *ss=mon->ss+i;
         rtkim_def_t *def=mon->def+i;
+        double sss_e,sss_n,sss_u;
+        double sube,subn,subu,hsub;
         if (!ss->act||!ss->valid) continue;
         ssig[0]=ss->sig[0]; ssig[1]=ss->sig[1]; ssig[2]=ss->sig[2];
-        for (k=0;k<3;k++) {
-            sss=SQRT_(SQR_(ssig[k])-SQR_(msig[k]));
-            subp=K_SUB*ssig[k]+K_SS*sss;
-            if (k==0&&subp>pe) {
-                pe=subp; pl->hsrc=def->id; pl->hmode=def->mode; pl->hsat=def->sat;
-                pl->hsig[0]=ssig[0]; pl->hsig[1]=ssig[1]; pl->hsig[2]=ssig[2];
-                pl->hsep[0]=ss->sep[0]; pl->hsep[1]=ss->sep[1]; pl->hsep[2]=ss->sep[2];
-            }
-            if (k==1&&subp>pn) {
-                pn=subp; pl->hsrc=def->id; pl->hmode=def->mode; pl->hsat=def->sat;
-                pl->hsig[0]=ssig[0]; pl->hsig[1]=ssig[1]; pl->hsig[2]=ssig[2];
-                pl->hsep[0]=ss->sep[0]; pl->hsep[1]=ss->sep[1]; pl->hsep[2]=ss->sep[2];
-            }
-            if (k==2&&subp>pu) {
-                pu=subp; pl->vsrc=def->id; pl->vmode=def->mode; pl->vsat=def->sat;
-                pl->vsig[0]=ssig[0]; pl->vsig[1]=ssig[1]; pl->vsig[2]=ssig[2];
-                pl->vsep[0]=ss->sep[0]; pl->vsep[1]=ss->sep[1]; pl->vsep[2]=ss->sep[2];
-            }
+        sss_e=SQRT_(SQR_(ssig[0])-SQR_(msig[0]));
+        sss_n=SQRT_(SQR_(ssig[1])-SQR_(msig[1]));
+        sss_u=SQRT_(SQR_(ssig[2])-SQR_(msig[2]));
+        sube=ksub*ssig[0]+kss*sss_e;
+        subn=ksub*ssig[1]+kss*sss_n;
+        subu=ksub*ssig[2]+kss*sss_u;
+        hsub=SQRT_(SQR_(sube)+SQR_(subn));
+        if (hsub>hpl0) {
+            hpl0=hsub;
+            pe=sube; pn=subn;
+            pl->hsrc=def->id; pl->hmode=def->mode; pl->hsat=def->sat;
+            pl->hsig[0]=ssig[0]; pl->hsig[1]=ssig[1]; pl->hsig[2]=ssig[2];
+            pl->hsss[0]=sss_e; pl->hsss[1]=sss_n; pl->hsss[2]=0.0;
+            pl->hsep[0]=ss->sep[0]; pl->hsep[1]=ss->sep[1]; pl->hsep[2]=ss->sep[2];
+        }
+        if (subu>pu) {
+            pu=subu; pl->vsrc=def->id; pl->vmode=def->mode; pl->vsat=def->sat;
+            pl->vsig[0]=ssig[0]; pl->vsig[1]=ssig[1]; pl->vsig[2]=ssig[2];
+            pl->vsss[0]=0.0; pl->vsss[1]=0.0; pl->vsss[2]=sss_u;
+            pl->vsep[0]=ss->sep[0]; pl->vsep[1]=ss->sep[1]; pl->vsep[2]=ss->sep[2];
         }
     }
     pl->pe=pe; pl->pn=pn; pl->pu=pu;
-    pl->hpl0=SQRT_(SQR_(pe)+SQR_(pn));
+    pl->hpl0=hpl0;
     pl->vpl0=pu;
 #if ENABLE_RTK_ARAIM_PL_BIAS_TERM
     if (calcbiasenu(rtk,&be,&bn,&bu,&brows)) {
@@ -532,18 +935,23 @@ static void calcpl(rtk_t *rtk)
     pl->vadd=pl->vpl-pl->vpl0;
     rtk->int_hpl=pl->hpl;
     rtk->int_vpl=pl->vpl;
+#endif
 }
 
 static void evalfde(rtk_t *rtk)
 {
     rtkim_t *mon=&rtk->intg;
     rtkim_fde_t best={0};
+    double kss=0.0;
+#if ENABLE_RTK_INTEGRITY_CHI2_GATE
     double chi2_thres=0.0;
+#endif
     int i,k;
     if (!rtk->opt.enable_rtk_integrity_fde_recovery) {
         mon->fde=best;
         return;
     }
+#if ENABLE_RTK_INTEGRITY_CHI2_GATE
     if (rtk->sol.dof>0) {
         chi2_thres=rtk->sol.dof<=100?chisqr[rtk->sol.dof-1]:chisqr[99];
     }
@@ -551,13 +959,20 @@ static void evalfde(rtk_t *rtk)
         mon->fde=best;
         return;
     }
+#else
+    if (rtk->sol.stat==SOLQ_NONE) {
+        mon->fde=best;
+        return;
+    }
+#endif
+    integrity_thresholds(&rtk->opt,mon->ndef,NULL,NULL,&kss);
     for (i=0;i<mon->ndef;i++) {
         rtkim_ss_t *ss=mon->ss+i;
         rtkim_def_t *def=mon->def+i;
         double score=0.0;
         if (!ss->act||!ss->valid) continue;
         for (k=0;k<3;k++) {
-            double th=K_SS*SQRT_(SQR_(ss->sig[k])-SQR_(mon->pl.msig[k]));
+            double th=kss*SQRT_(SQR_(ss->sig[k])-SQR_(mon->pl.msig[k]));
             double st=fabs(ss->sep[k]);
             double sc=th>0.0?st/th:0.0;
             if (sc>score) score=sc;
@@ -720,6 +1135,51 @@ EXPORT void rtkim_detect(rtk_t *rtk, const obsd_t *obs, int nobs,
     mon->ep.ratio=rtk->sol.ratio;
     mon->ep.fixed=rtk->sol.stat==SOLQ_FIX;
     mon->ep.fixed_upd=mon->ep.fixed;
+#if RTK_INT_METHOD==RTK_INT_METHOD_SLOPE
+    mon->ndef=0;
+    mon->nact=0;
+    memset(&mon->fde,0,sizeof(mon->fde));
+    memset(&mon->act,0,sizeof(mon->act));
+    rtk->int_fde_mode=0;
+    rtk->int_fde_sat=0;
+    if (rtk->opt.enable_rtk_integrity_fde_recovery&&rtk->sol.stat!=SOLQ_NONE&&
+        mon->bv&&mon->bR&&mon->bnv>3) {
+        double *W=mat(mon->bnv,mon->bnv),stat=0.0,thres=0.0;
+        int j,k,dof=mon->bnv-3;
+        if (W) {
+            matcpy(W,mon->bR,mon->bnv,mon->bnv);
+            if (!matinv(W,mon->bnv)) {
+                for (j=0;j<mon->bnv;j++) for (k=0;k<mon->bnv;k++) {
+                    stat+=mon->bv[j]*W[j+k*mon->bnv]*mon->bv[k];
+                }
+                if (dof>0) {
+                    thres=dof<=100?chisqr[dof-1]:chisqr[99];
+                    if (stat>thres) {
+                        mon->fde.mode=RTKIM_F_NFIX;
+                        mon->fde.score=thres>0.0?stat/thres:stat;
+                        mon->fde.act=RTKIM_A_FLOAT;
+                        mon->act=mon->fde;
+                        rtk->int_fde_mode=mon->fde.mode;
+                    }
+                }
+            }
+            free(W);
+        }
+    }
+    return;
+#elif RTK_INT_METHOD==RTK_INT_METHOD_LS_SS
+    if (rtk->opt.enable_monitor_single_satellite_fault) {
+        for (i=0;i<ns;i++) getdef(rtk,RTKIM_F_SAT,sat[i]);
+    }
+    if (build_ls_subsets(rtk,mon->pl.msig,NULL)) {
+        evalfde(rtk);
+    }
+    else {
+        mon->nact=0;
+        memset(&mon->fde,0,sizeof(mon->fde));
+    }
+    return;
+#endif
     if (rtk->opt.enable_monitor_single_satellite_fault) {
         for (i=0;i<ns;i++) getdef(rtk,RTKIM_F_SAT,sat[i]);
     }
@@ -817,9 +1277,15 @@ EXPORT int rtkim_open(const char *outfile, const prcopt_t *opt)
         fprint_center(fp_pld,4,"Hsrc"); fputc(' ',fp_pld);
         fprint_center(fp_pld,5,"Hmode"); fputc(' ',fp_pld);
         fprint_center(fp_pld,4,"Hsat"); fputc(' ',fp_pld);
+        fprint_center(fp_pld,8,"MsigE"); fputc(' ',fp_pld);
+        fprint_center(fp_pld,8,"MsigN"); fputc(' ',fp_pld);
+        fprint_center(fp_pld,8,"MsigU"); fputc(' ',fp_pld);
         fprint_center(fp_pld,8,"HsigE"); fputc(' ',fp_pld);
         fprint_center(fp_pld,8,"HsigN"); fputc(' ',fp_pld);
         fprint_center(fp_pld,8,"HsigU"); fputc(' ',fp_pld);
+        fprint_center(fp_pld,8,"HsssE"); fputc(' ',fp_pld);
+        fprint_center(fp_pld,8,"HsssN"); fputc(' ',fp_pld);
+        fprint_center(fp_pld,8,"HsssU"); fputc(' ',fp_pld);
         fprint_center(fp_pld,8,"HsepE"); fputc(' ',fp_pld);
         fprint_center(fp_pld,8,"HsepN"); fputc(' ',fp_pld);
         fprint_center(fp_pld,8,"HsepU"); fputc(' ',fp_pld);
@@ -829,6 +1295,9 @@ EXPORT int rtkim_open(const char *outfile, const prcopt_t *opt)
         fprint_center(fp_pld,8,"VsigE"); fputc(' ',fp_pld);
         fprint_center(fp_pld,8,"VsigN"); fputc(' ',fp_pld);
         fprint_center(fp_pld,8,"VsigU"); fputc(' ',fp_pld);
+        fprint_center(fp_pld,8,"VsssE"); fputc(' ',fp_pld);
+        fprint_center(fp_pld,8,"VsssN"); fputc(' ',fp_pld);
+        fprint_center(fp_pld,8,"VsssU"); fputc(' ',fp_pld);
         fprint_center(fp_pld,8,"VsepE"); fputc(' ',fp_pld);
         fprint_center(fp_pld,8,"VsepN"); fputc(' ',fp_pld);
         fprint_center(fp_pld,8,"VsepU"); fputc(' ',fp_pld);
@@ -1082,14 +1551,15 @@ EXPORT void rtkim_out(const rtk_t *rtk)
             rtk->int_fde_action);
     }
     if (fp_pld) {
-        fprintf(fp_pld,"%-23s %4d %2d %7.3f %6d %6d %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %5d %5d %4d %5d %4d %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %4d %5d %4d %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %10d %9d %9d\n",
+        fprintf(fp_pld,"%-23s %4d %2d %7.3f %6d %6d %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %5d %5d %4d %5d %4d %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %4d %5d %4d %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %10d %9d %9d\n",
             time_str(mon->ep.time,3),rtk->sol.ns,rtk->sol.stat,rtk->sol.ratio,
             mon->ndef,mon->nact,pl->hpl,pl->vpl,pl->be,pl->bn,pl->bu,pl->hpl0,
             pl->vpl0,pl->hadd,pl->vadd,pl->bias_loaded,pl->bias_rows,
-            pl->hsrc,pl->hmode,pl->hsat,pl->hsig[0],pl->hsig[1],
-            pl->hsig[2],pl->hsep[0],pl->hsep[1],pl->hsep[2],pl->vsrc,
+            pl->hsrc,pl->hmode,pl->hsat,pl->msig[0],pl->msig[1],pl->msig[2],
+            pl->hsig[0],pl->hsig[1],pl->hsig[2],pl->hsss[0],pl->hsss[1],pl->hsss[2],
+            pl->hsep[0],pl->hsep[1],pl->hsep[2],pl->vsrc,
             pl->vmode,pl->vsat,pl->vsig[0],pl->vsig[1],pl->vsig[2],
-            pl->vsep[0],pl->vsep[1],pl->vsep[2],rtk->int_fde_pre_mode,
+            pl->vsss[0],pl->vsss[1],pl->vsss[2],pl->vsep[0],pl->vsep[1],pl->vsep[2],rtk->int_fde_pre_mode,
             rtk->int_fde_pre_sat,rtk->int_fde_action);
     }
     subout(rtk);

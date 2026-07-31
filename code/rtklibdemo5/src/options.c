@@ -125,6 +125,8 @@ EXPORT opt_t sysopts[]={
     {"rtkint-debug-subset", 0, (void *)&prcopt_.rtk_integrity_debug_subset_id,         ""},
     {"rtkint-debug-sat",    0, (void *)&prcopt_.rtk_integrity_debug_satellite,         ""},
     {"rtkint-debug-pl",     1, (void *)&prcopt_.rtk_integrity_debug_pl_threshold,      "m"},
+    {"rtkint-pfa",          1, (void *)&prcopt_.rtk_integrity_false_alarm_prob,        ""},
+    {"rtkint-pmd",          1, (void *)&prcopt_.rtk_integrity_miss_detect_prob,        ""},
 #endif
     
     {"out-solformat",   3,  (void *)&solopt_.posf,       SOLOPT },
@@ -523,6 +525,8 @@ extern void resetsysopts(void)
     prcopt_.rtk_integrity_debug_subset_id=0;
     prcopt_.rtk_integrity_debug_satellite=0;
     prcopt_.rtk_integrity_debug_pl_threshold=0.0;
+    prcopt_.rtk_integrity_false_alarm_prob=1e-6;
+    prcopt_.rtk_integrity_miss_detect_prob=5e-8;
 #endif
     filopt_.satantp[0]='\0';
     filopt_.rcvantp[0]='\0';

@@ -89,7 +89,7 @@ int main(int argc,char *argv)
     char resultpath[] = "F:\\RTKLib-LAB\\result";
 
     //////////////////////////////////////////////////////注意更改文件夹
-    char str_envir[] = "\\Build\\";
+    char str_envir[] = "\\Static\\";
 
     char* str[5];
     for (int i = 0; i < 5; i++) {
@@ -99,9 +99,9 @@ int main(int argc,char *argv)
     }
 
     //记得改文件名尤其是24/25O
-    char* infile[3] = { {strcat(str[0],"rover.21O")},{strcat(str[1],"rover.21P")}};
+    char* infile[3] = { {strcat(str[0],"rover.25O")},{strcat(str[1],"rover.25P")}};
     char outfile[256] = "";
-    infile[2] = strcat(str[3],"base.21O");
+    infile[2] = strcat(str[3],"base.25O");
     strcpy(outfile, resultpath);
     strcat(outfile, str_envir);
     strcat(outfile, "test.pos");
@@ -114,8 +114,8 @@ int main(int argc,char *argv)
 	prcopt.mode = PMODE_KINEMA; /* {PMODE_SINGLE;PMODE_KINEMA; PMODE_DGPS;PMODE_STATIC} */
 	prcopt.nf= 2;  //频率
     prcopt.elmin = 10 * D2R;//截止高度角（弧度）
-    prcopt.weightmode=WEIGHTOPT_ELEVATION;
-    //prcopt.weightmode=WEIGHTOPT_SNR;
+    //prcopt.weightmode=WEIGHTOPT_ELEVATION;
+    prcopt.weightmode=WEIGHTOPT_SNR;
     //prcopt.weightmode = WEIGHTOPT_PLD;                   //包含PLD观测值才可以使用
     //prcopt.weightmode = WEIGHTOPT_CV_PV;
     //prcopt.weightmode = WEIGHTOPT_ELE_SNR;
@@ -137,12 +137,12 @@ int main(int argc,char *argv)
     prcopt.minfix = 10; //holdamb的最小固定历元数
     prcopt.maxout = 3;//连续3个历元卫星不可用则初始化模糊度
     prcopt.chkMaxPLD = 120; //PLD最大阈值
-	prcopt.thresar[0]=2.5;
+	prcopt.thresar[0]=3.0;
     prcopt.dynamics = 0;
     
 #ifdef ENABLE_RTK_INTEGRITY
     /* Integrity master switches */
-    prcopt.enable_rtk_integrity_monitor = 0;
+    prcopt.enable_rtk_integrity_monitor = 1;
     prcopt.enable_rtk_integrity_rbias_export = 0;
 
     /* Monitored fault modes */
@@ -158,6 +158,8 @@ int main(int argc,char *argv)
     prcopt.rtk_integrity_debug_subset_id = 0;
     prcopt.rtk_integrity_debug_satellite = 0;
     prcopt.rtk_integrity_debug_pl_threshold = 0.0;
+    prcopt.rtk_integrity_false_alarm_prob = 1e-6;
+    prcopt.rtk_integrity_miss_detect_prob = 5e-8;
 #endif
 #if ENABLE_RTK_SKIP_EPOCH
     prcopt.rtk_skip_epoch_time[0] = 2021;

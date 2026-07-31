@@ -42,14 +42,32 @@
 #ifndef ENABLE_RTK_INTEGRITY
 #define ENABLE_RTK_INTEGRITY
 #endif
+#define RTK_INT_METHOD_FILTER_SS 0
+#define RTK_INT_METHOD_LS_SS     1
+#define RTK_INT_METHOD_SLOPE     2
+#ifndef RTK_INT_METHOD
+#define RTK_INT_METHOD RTK_INT_METHOD_FILTER_SS
+#endif
 #ifndef ENABLE_RTK_DEBUG_OUTPUT
 #define ENABLE_RTK_DEBUG_OUTPUT 1
 #endif
 #ifndef ENABLE_RTK_SKIP_EPOCH
-#define ENABLE_RTK_SKIP_EPOCH 1
+#define ENABLE_RTK_SKIP_EPOCH 0
 #endif
 #ifndef ENABLE_RTK_ARAIM_PL_BIAS_TERM
 #define ENABLE_RTK_ARAIM_PL_BIAS_TERM 1
+#endif
+#ifndef ENABLE_RTK_INTEGRITY_CHI2_GATE
+#define ENABLE_RTK_INTEGRITY_CHI2_GATE 1
+#endif
+#ifndef ENABLE_RTK_PARTIAL_AR
+#define ENABLE_RTK_PARTIAL_AR 1
+#endif
+#ifndef ENABLE_RTK_AR_CP_RMS_GATE
+#define ENABLE_RTK_AR_CP_RMS_GATE 1
+#endif
+#ifndef RTK_AR_CP_RMS_GATE_THRESH
+#define RTK_AR_CP_RMS_GATE_THRESH 0.05 //m
 #endif
 
 #include <stdio.h>
@@ -986,6 +1004,7 @@ typedef struct {        /* solution type */
     gtime_t eventime;   /* time of event (GPST) */
     double rr[6];       /* position/velocity (m|m/s) */
                         /* {x,y,z,vx,vy,vz} or {e,n,u,ve,vn,vu} */
+    double rr_flt[3];   /* filtered float position for current epoch */
     float  qr[6];       /* position variance/covariance (m^2) */
                         /* {c_xx,c_yy,c_zz,c_xy,c_yz,c_zx} or */
                         /* {c_ee,c_nn,c_uu,c_en,c_nu,c_ue} */
@@ -996,6 +1015,8 @@ typedef struct {        /* solution type */
     unsigned char ns;   /* number of valid satellites */
     float age;          /* age of differential (s) */
     float ratio;        /* AR ratio factor for valiation */
+    float rms_pr;       /* epoch pseudorange residual rms (m) */
+    float rms_cp;       /* epoch carrier-phase residual rms (m) */
     float prev_ratio1;   /* previous initial AR ratio factor for validation */
     float prev_ratio2;   /* previous final AR ratio factor for validation */
     float thres;        /* AR ratio threshold for valiation */
@@ -1199,6 +1220,8 @@ typedef struct {        /* processing options type */
     int rtk_integrity_debug_subset_id;
     int rtk_integrity_debug_satellite;
     double rtk_integrity_debug_pl_threshold;
+    double rtk_integrity_false_alarm_prob;
+    double rtk_integrity_miss_detect_prob;
 #endif
 
     //设置PLD的最大和最小阈值

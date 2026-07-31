@@ -110,6 +110,22 @@ static FILE* fp_stat = NULL;       /* rtk status file pointer */
 static FILE* fp_model = NULL;    /* rtk model file pointer */
 static char file_stat[1024] = "";  /* rtk status file original path */
 static gtime_t time_stat = { 0 };    /* rtk status file time */
+#define AR_MAX_CP_RMS RTK_AR_CP_RMS_GATE_THRESH
+
+static double residual_rms(const rtk_t *rtk, int phase, int *count)
+{
+    double s=0.0;
+    int i,f,n=0,nf=NF(&rtk->opt);
+
+    for (i=0;i<MAXSAT;i++) for (f=0;f<nf&&f<NFREQ;f++) {
+        double r=phase?rtk->ssat[i].resc[f]:rtk->ssat[i].resp[f];
+        if (!rtk->ssat[i].vsat[f]||r==0.0) continue;
+        s+=r*r;
+        n++;
+    }
+    if (count) *count=n;
+    return n>0?sqrt(s/n):0.0;
+}
 
 /* open solution status file ---------------------------------------------------
 * open solution status file and set output level
@@ -2502,6 +2518,198 @@ static int resamb_LAMBDA(rtk_t* rtk, double* bias, double* xa)
 	return nb; /* number of ambiguities */
 }
 
+#if ENABLE_RTK_PARTIAL_AR
+static int build_ar_matrices(rtk_t* rtk, double** amb_f_out, double** Qb_out, double** Qab_out, int* nb_out)
+{
+	prcopt_t* opt = &rtk->opt;
+	int i, j, nx = rtk->nx, na = rtk->na, ny, nb;
+	double *D, *DP, *y, *Qy, *Qb, *Qab;
+
+	*amb_f_out = NULL;
+	*Qb_out = NULL;
+	*Qab_out = NULL;
+	*nb_out = 0;
+
+	if (rtk->opt.mode <= PMODE_DGPS || rtk->opt.modear == ARMODE_OFF || rtk->opt.thresar[0] < 1.0) {
+		return 0;
+	}
+	D = zeros(nx, nx);
+	if ((nb = ddmat(rtk, D)) < (rtk->opt.minfixsats - 1)) {
+		free(D);
+		return 0;
+	}
+	ny = na + nb;
+	y = mat(ny, 1);
+	Qy = mat(ny, ny);
+	DP = mat(ny, nx);
+	Qb = mat(nb, nb);
+	Qab = mat(na, nb);
+
+	matmul("TN", ny, 1, nx, 1.0, D, rtk->x, 0.0, y);
+	matmul("TN", ny, nx, nx, 1.0, D, rtk->P, 0.0, DP);
+	matmul("NN", ny, ny, nx, 1.0, DP, D, 0.0, Qy);
+
+	for (i = 0; i < nb; i++) {
+		for (j = 0; j < nb; j++) {
+			Qb[i + j * nb] = Qy[na + i + (na + j) * ny];
+		}
+	}
+	for (i = 0; i < na; i++) for (j = 0; j < nb; j++) {
+		Qab[i + j * na] = Qy[i + (na + j) * ny];
+	}
+
+	*amb_f_out = y;
+	*Qb_out = Qb;
+	*Qab_out = Qab;
+	*nb_out = nb;
+
+	free(D);
+	free(DP);
+	free(Qy);
+	rtk->nb_ar = nb;
+	return 1;
+}
+
+static int par_worst_amb(const double* amb_f, const double* Qb, const int* idxs, int nidx, int nb)
+{
+	int i, iw = 0;
+	double smax = -1.0;
+
+	for (i = 0; i < nidx; i++) {
+		int idx = idxs[i];
+		double frac = fabs(amb_f[idx] - ROUND(amb_f[idx]));
+		double var = Qb[idx + idx * nb];
+		double score = sqrt(frac * frac + (var > 0.0 ? var : 0.0));
+		if (score > smax) {
+			smax = score;
+			iw = i;
+		}
+	}
+	return iw;
+}
+
+static int resamb_LAMBDA_subset(rtk_t* rtk, const double* amb_f, const double* Qb_full,
+	const double* Qab_full, int nb, const int* idxs, int nidx, double* bias_full, double* xa)
+{
+	int i, j, na = rtk->na, info;
+	double *a_sub, *Qb_sub, *Qab_sub, *b, *db, *QQ, s[2];
+	double cp_rms = 0.0;
+
+	rtk->sol.ratio = 0.0;
+	rtk->sol.thres = (float)rtk->opt.thresar[0];
+	if (nidx < 1) return 0;
+
+	a_sub = mat(nidx, 1);
+	Qb_sub = mat(nidx, nidx);
+	Qab_sub = mat(na, nidx);
+	b = mat(nidx, 2);
+	db = mat(nidx, 1);
+	QQ = mat(na, nidx);
+
+	for (i = 0; i < nidx; i++) {
+		a_sub[i] = amb_f[idxs[i]];
+		for (j = 0; j < nidx; j++) {
+			Qb_sub[i + j * nidx] = Qb_full[idxs[i] + idxs[j] * nb];
+		}
+		for (j = 0; j < na; j++) {
+			Qab_sub[j + i * na] = Qab_full[j + idxs[i] * na];
+		}
+	}
+
+	if ((info = lambda(nidx, 2, a_sub, Qb_sub, b, s)) != 0) {
+		free(a_sub); free(Qb_sub); free(Qab_sub); free(b); free(db); free(QQ);
+		return 0;
+	}
+	rtk->sol.ratio = s[0] > 0.0 ? (float)(s[1] / s[0]) : 0.0f;
+	if (rtk->sol.ratio > 999.9) rtk->sol.ratio = 999.9f;
+	if (s[0] > 0.0 && s[1] / s[0] < rtk->sol.thres) {
+		free(a_sub); free(Qb_sub); free(Qab_sub); free(b); free(db); free(QQ);
+		return 0;
+	}
+
+	for (i = 0; i < na; i++) {
+		rtk->xa[i] = rtk->x[i];
+		for (j = 0; j < na; j++) rtk->Pa[i + j * na] = rtk->P[i + j * rtk->nx];
+	}
+
+	for (i = 0; i < nb; i++) bias_full[i] = amb_f[i];
+	for (i = 0; i < nidx; i++) {
+		bias_full[idxs[i]] = b[i];
+		a_sub[i] -= b[i];
+	}
+
+	if (matinv(Qb_sub, nidx)) {
+		free(a_sub); free(Qb_sub); free(Qab_sub); free(b); free(db); free(QQ);
+		return 0;
+	}
+
+	matmul("NN", nidx, 1, nidx, 1.0, Qb_sub, a_sub, 0.0, db);
+	matmul("NN", na, 1, nidx, -1.0, Qab_sub, db, 1.0, rtk->xa);
+	matmul("NN", na, nidx, nidx, 1.0, Qab_sub, Qb_sub, 0.0, QQ);
+	matmul("NT", na, na, nidx, -1.0, QQ, Qab_sub, 1.0, rtk->Pa);
+
+	restamb(rtk, bias_full, nb, xa);
+#if ENABLE_RTK_AR_CP_RMS_GATE
+	cp_rms = residual_rms(rtk, 1, NULL);
+	if (cp_rms >= AR_MAX_CP_RMS) {
+		errmsg(rtk, "PAR subset rejected by carrier-phase rms gate (nb=%d ratio=%.2f cp_rms=%.4f limit=%.4f)\n",
+			nidx, rtk->sol.ratio, cp_rms, AR_MAX_CP_RMS);
+		free(a_sub); free(Qb_sub); free(Qab_sub); free(b); free(db); free(QQ);
+		return 0;
+	}
+#endif
+
+	free(a_sub); free(Qb_sub); free(Qab_sub); free(b); free(db); free(QQ);
+	return nidx;
+}
+
+static int manage_amb_PAR(rtk_t* rtk, double* bias, double* xa)
+{
+	static const int par_max_removals = 15;
+	static const double par_max_remove_ratio = 0.75;
+	int i, k, nb, nidx, nmin, nmax, ndel, iw;
+	int *idxs = NULL;
+	double *amb_f = NULL, *Qb = NULL, *Qab = NULL;
+	int ret = 0;
+
+	if (!build_ar_matrices(rtk, &amb_f, &Qb, &Qab, &nb)) {
+		return 0;
+	}
+	if (!(idxs = imat(nb, 1))) {
+		free(amb_f); free(Qb); free(Qab);
+		return 0;
+	}
+
+	nidx = nb;
+	for (i = 0; i < nb; i++) idxs[i] = i;
+	nmin = MAX(rtk->opt.minfixsats - 1, 4);
+	if (nidx < nmin) {
+		free(idxs); free(amb_f); free(Qb); free(Qab);
+		return 0;
+	}
+
+	nmax = (int)(nidx * par_max_remove_ratio + 1.0);
+	if (nmax > par_max_removals) nmax = par_max_removals;
+	ndel = 0;
+
+	while (nidx >= nmin && ndel <= nmax) {
+		ret = resamb_LAMBDA_subset(rtk, amb_f + rtk->na, Qb, Qab, nb, idxs, nidx, bias, xa);
+		if (ret > 0) {
+			rtk->nb_ar = ret;
+			break;
+		}
+
+		iw = par_worst_amb(amb_f + rtk->na, Qb, idxs, nidx, nb);
+		for (k = iw; k < nidx - 1; k++) idxs[k] = idxs[k + 1];
+		nidx--;
+		ndel++;
+	}
+
+	free(idxs); free(amb_f); free(Qb); free(Qab);
+	return ret;
+}
+#endif
+
 /* resolve integer ambiguity by LAMBDA using partial fix techniques and multiple attempts -----------------------*/
 static int manage_amb_LAMBDA(rtk_t* rtk, double* bias, double* xa, const int* sat, int nf, int ns)
 {
@@ -2651,6 +2859,9 @@ static int manage_amb_LAMBDA(rtk_t* rtk, double* bias, double* xa, const int* sa
 		trace(3, "AR: restore sat %d\n", i);
 	}
 
+	if (ENABLE_RTK_PARTIAL_AR && nb <= 0) {
+		nb = manage_amb_PAR(rtk, bias, xa);
+	}
 	rtk->sol.prev_ratio1 = ratio1 > 0 ? ratio1 : rtk->sol.ratio;
 	rtk->sol.prev_ratio2 = rtk->sol.ratio;
 
@@ -2981,6 +3192,7 @@ static int relpos(rtk_t* rtk, const obsd_t* obs, int nu, int nr,
 		if (manage_amb_LAMBDA(rtk, bias, xa, sat, nf, ns) > 1) {
 			double *vf = NULL, *Rf = NULL;
 			int *vflgf = NULL, nvf = 0;
+			double cp_rms_fix = 0.0;
 
 			/* find zero-diff residuals for fixed solution */
 			if (zdres(0, obs, nu, rs, dts, var, svh, nav, xa, opt, 0, y, e, azel)) {
@@ -2998,21 +3210,33 @@ static int relpos(rtk_t* rtk, const obsd_t* obs, int nu, int nr,
 
 				/* validation of fixed solution, always returns valid */
 				if (nvf > 0 && valpos(rtk, vf, Rf, vflgf, nvf, 4.0, "fix")) {
-
-					/* hold integer ambiguity if meet minfix count */
-					if (rtk->sol.ratio >= rtk->sol.thres) rtk->nfix++;/*ratio >=3 ++*/
-					if (rtk->nfix >= rtk->opt.minfix) {
-						if (rtk->opt.modear == ARMODE_FIXHOLD || rtk->opt.glomodear == GLO_ARMODE_FIXHOLD)
-							holdamb(rtk, xa);
-						/* switch to kinematic after qualify for hold if in static-start mode */
-						if (rtk->opt.mode == PMODE_STATIC_START) {
-							rtk->opt.mode = PMODE_KINEMA;
-							trace(3, "Fix and hold complete: switch to kinematic mode\n");
-						}
+#if ENABLE_RTK_AR_CP_RMS_GATE
+					cp_rms_fix = residual_rms(rtk, 1, NULL);
+					if (cp_rms_fix >= AR_MAX_CP_RMS) {
+						errmsg(rtk, "fixed solution rejected by final carrier-phase rms gate (ratio=%.2f cp_rms=%.4f limit=%.4f)\n",
+							rtk->sol.ratio, cp_rms_fix, AR_MAX_CP_RMS);
+						rtk->nfix = 0;
 					}
-					stat = SOLQ_FIX;
+					else {
+#endif
+
+						/* hold integer ambiguity if meet minfix count */
+						if (rtk->sol.ratio >= rtk->sol.thres) rtk->nfix++;/*ratio >=3 ++*/
+						if (rtk->nfix >= rtk->opt.minfix) {
+							if (rtk->opt.modear == ARMODE_FIXHOLD || rtk->opt.glomodear == GLO_ARMODE_FIXHOLD)
+								holdamb(rtk, xa);
+							/* switch to kinematic after qualify for hold if in static-start mode */
+							if (rtk->opt.mode == PMODE_STATIC_START) {
+								rtk->opt.mode = PMODE_KINEMA;
+								trace(3, "Fix and hold complete: switch to kinematic mode\n");
+							}
+						}
+						stat = SOLQ_FIX;
 #ifdef ENABLE_RTK_INTEGRITY
-					rtkim_export_rbias(rtk,vf,vflgf,nvf);
+						rtkim_export_rbias(rtk,vf,vflgf,nvf);
+#endif
+#if ENABLE_RTK_AR_CP_RMS_GATE
+					}
 #endif
 				}
 			}
@@ -3025,6 +3249,11 @@ static int relpos(rtk_t* rtk, const obsd_t* obs, int nu, int nr,
 
 	//
 
+
+	/* keep the filtered float position for every epoch */
+	for (i = 0; i < 3; i++) {
+		rtk->sol.rr_flt[i] = rtk->x[i];
+	}
 
 	/* save solution status (fixed or float) */
 	if (stat == SOLQ_FIX) {
@@ -3147,7 +3376,9 @@ rtk->xa = zeros(rtk->na, 1);
 *-----------------------------------------------------------------------------*/
 extern void rtkfree(rtk_t* rtk)
 {
-trace(3, "rtkfree :\n");
+	trace(3, "rtkfree :\n");
+
+	if (!rtk) return;
 
 	rtk->nx = rtk->na = 0;
 	free(rtk->x); rtk->x = NULL;
@@ -3391,6 +3622,8 @@ extern int rtkpos(rtk_t* rtk, const obsd_t* obs, int n, const nav_t* nav, const 
 		}
 	}
 #endif
+	rtk->sol.rms_pr = (float)residual_rms(rtk, 0, NULL);
+	rtk->sol.rms_cp = (float)residual_rms(rtk, 1, NULL);
 	outsolstat(rtk, nav);
 
 	return 1;

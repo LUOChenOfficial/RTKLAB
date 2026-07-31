@@ -54,6 +54,7 @@ typedef struct {
     double be,bn,bu;
     double pe,pn,pu;
     double msig[3];
+    double hsss[3],vsss[3];
     int bias_loaded,bias_rows;
     int hsrc,hmode,hsat;
     int vsrc,vmode,vsat;
