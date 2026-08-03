@@ -1235,7 +1235,9 @@ EXPORT int rtkim_open(const char *outfile, const prcopt_t *opt)
     }
     if (fp_pint) {
         fputs("% ",fp_pint);
-        fprint_center(fp_pint,23,"time"); fputc(' ',fp_pint);
+        /* "% " is a two-character comment prefix, so use 21 to match the
+         * 23-character timestamp field in the data rows. */
+        fprint_center(fp_pint,21,"time"); fputc(' ',fp_pint);
         fprint_center(fp_pint,12,"x"); fputc(' ',fp_pint);
         fprint_center(fp_pint,12,"y"); fputc(' ',fp_pint);
         fprint_center(fp_pint,12,"z"); fputc(' ',fp_pint);

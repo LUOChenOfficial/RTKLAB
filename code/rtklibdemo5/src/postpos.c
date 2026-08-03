@@ -550,7 +550,7 @@ static void procpos(FILE *fp, FILE *fptm, const prcopt_t *popt, const solopt_t *
             sys = satsys(obs[i].sat, &prn);
             if ((satsys(obs[i].sat, NULL) & popt->navsys) &&
                 popt->exsats[obs[i].sat - 1] != 1) {
-                if (sys == SYS_CMP && (prn > 46 || prn <= 5))   continue;/*exclude BDS-3 GEO satellite*/
+                if (sys == SYS_CMP && BDS_EXCLUDE_OBS_PRN(prn)) continue;
                 if (!obs[i].P[0] || !obs[i].L[0]) continue;/*ensure the integrity of the first frequency obs*/
                 obs[n++] = obs[i];
             }
@@ -1185,7 +1185,8 @@ static FILE *openfile(const char *outfile)
     trace(3,"openfile: outfile=%s\n",outfile);
 
     if (*outfile) ensure_parent_dir(outfile);
-    return !*outfile?stdout:fopen(outfile,"w");
+    /* outhead() has already created this file and written the table header. */
+    return !*outfile?stdout:fopen(outfile,"a");
 }
 /* Name time marks file ------------------------------------------------------*/
 static void namefiletm(char *outfiletm, const char *outfile)
@@ -1297,11 +1298,11 @@ static int execses(gtime_t ts, gtime_t te, double ti, const prcopt_t *popt,
 #ifdef ENABLE_RTK_INTEGRITY
     if (flag) rtkim_open(outfile,&popt_);
 #endif
-    ///* write header to output file */
-    //if (flag&&!outhead(outfile,infile,n,&popt_,sopt)) {
-    //    freeobsnav(&obss,&navs);
-    //    return 0;
-    //}
+    /* write header to output file */
+    if (flag&&!outhead(outfile,infile,n,&popt_,sopt)) {
+        freeobsnav(&obss,&navs);
+        return 0;
+    }
     /////* name time events file */
     ////namefiletm(outfiletm,outfile);
 

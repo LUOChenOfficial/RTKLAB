@@ -556,7 +556,7 @@ static int decode_stqbds(raw_t *raw)
         trace(2,"stq bds subframe id error: prn=%2d\n",prn);
         return -1;
     }
-    if (prn>5) { /* IGSO/MEO */
+    if (!BDS_GEO_PRN(prn)) { /* IGSO/MEO */
         word=getbitu(p+3,j,26)<<4; j+=26;
         setbitu(raw->subfrm[sat-1]+(id-1)*38,0,30,word);
         

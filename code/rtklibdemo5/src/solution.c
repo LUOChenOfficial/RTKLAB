@@ -1592,12 +1592,22 @@ extern int outprcopts(unsigned char *buff, const prcopt_t *opt)
 *          solopt_t *opt    I   solution options
 * return : number of output bytes
 *-----------------------------------------------------------------------------*/
+static int append_centered_field(char *buff, int width, const char *label)
+{
+    int length=(int)strlen(label),left,right;
+
+    if (length>=width) return sprintf(buff,"%s",label);
+    left=(width-length)/2;
+    right=width-length-left;
+    return sprintf(buff,"%*s%s%*s",left,"",label,right,"");
+}
 extern int outsolheads(unsigned char *buff, const solopt_t *opt)
 {
     const char *s1[]={"WGS84","Tokyo"},*s2[]={"ellipsoidal","geodetic"};
     const char *s3[]={"GPST","UTC ","JST "},*sep=opt2sep(opt);
     char *p=(char *)buff;
     int timeu=opt->timeu<0?0:(opt->timeu>20?20:opt->timeu);
+    int timew;
     
     trace(3,"outsolheads:\n");
     
@@ -1611,7 +1621,12 @@ extern int outsolheads(unsigned char *buff, const solopt_t *opt)
         else p+=sprintf(p,"lat/lon/height=%s/%s",s1[opt->datum],s2[opt->height]);
         p+=sprintf(p,",Q=1:fix,2:float,3:sbas,4:dgps,5:single,6:ppp,ns=# of satellites)\n");
     }
-    p+=sprintf(p,"%s  %-*s%s",COMMENTH,(opt->timef?16:8)+timeu+1,s3[opt->times],sep);
+    /* "% " occupies two columns in a comment header. The remaining width
+     * matches the timestamp field emitted by outsols(). */
+    timew=(opt->timef?16:8)+timeu+2;
+    p+=sprintf(p,"%s ",COMMENTH);
+    p+=append_centered_field(p,timew,s3[opt->times]);
+    p+=sprintf(p,"%s",sep);
     
     if (opt->posf==SOLF_LLH) { /* lat/lon/hgt */
         if (opt->degf) {
@@ -1635,11 +1650,24 @@ extern int outsolheads(unsigned char *buff, const solopt_t *opt)
         }
     }
     else if (opt->posf==SOLF_XYZ) { /* x/y/z-ecef */
-        p+=sprintf(p,"%14s%s%14s%s%14s%s%3s%s%3s%s%8s%s%8s%s%8s%s%8s%s%8s%s%8s%s%6s%s%6s%s%11s%s%12s%s%14s%s%14s%s%14s",
-                   "x-ecef(m)",sep,"y-ecef(m)",sep,"z-ecef(m)",sep,"Q",sep,"ns",sep,
-                   "sdx(m)",sep,"sdy(m)",sep,"sdz(m)",sep,"sdxy(m)",sep,
-                   "sdyz(m)",sep,"sdzx(m)",sep,"age(s)",sep,"ratio",
-                   sep,"rms_pr(m)",sep,"rms_cp(m)",sep,"float_x(m)",sep,"float_y(m)",sep,"float_z(m)");
+        p+=append_centered_field(p,14,"x-ecef(m)"); p+=sprintf(p,"%s",sep);
+        p+=append_centered_field(p,14,"y-ecef(m)"); p+=sprintf(p,"%s",sep);
+        p+=append_centered_field(p,14,"z-ecef(m)"); p+=sprintf(p,"%s",sep);
+        p+=append_centered_field(p,3,"Q"); p+=sprintf(p,"%s",sep);
+        p+=append_centered_field(p,3,"ns"); p+=sprintf(p,"%s",sep);
+        p+=append_centered_field(p,8,"sdx(m)"); p+=sprintf(p,"%s",sep);
+        p+=append_centered_field(p,8,"sdy(m)"); p+=sprintf(p,"%s",sep);
+        p+=append_centered_field(p,8,"sdz(m)"); p+=sprintf(p,"%s",sep);
+        p+=append_centered_field(p,8,"sdxy(m)"); p+=sprintf(p,"%s",sep);
+        p+=append_centered_field(p,8,"sdyz(m)"); p+=sprintf(p,"%s",sep);
+        p+=append_centered_field(p,8,"sdzx(m)"); p+=sprintf(p,"%s",sep);
+        p+=append_centered_field(p,6,"age(s)"); p+=sprintf(p,"%s",sep);
+        p+=append_centered_field(p,6,"ratio"); p+=sprintf(p,"%s",sep);
+        p+=append_centered_field(p,11,"rms_pr(m)"); p+=sprintf(p,"%s",sep);
+        p+=append_centered_field(p,12,"rms_cp(m)"); p+=sprintf(p,"%s",sep);
+        p+=append_centered_field(p,14,"float_x(m)"); p+=sprintf(p,"%s",sep);
+        p+=append_centered_field(p,14,"float_y(m)"); p+=sprintf(p,"%s",sep);
+        p+=append_centered_field(p,14,"float_z(m)");
         
         if (opt->outvel) {
             p+=sprintf(p,"%s%10s%s%10s%s%10s%s%9s%s%8s%s%8s%s%8s%s%8s%s%8s",

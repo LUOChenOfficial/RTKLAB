@@ -99,9 +99,9 @@ int main(int argc,char *argv)
     }
 
     //记得改文件名尤其是24/25O
-    char* infile[3] = { {strcat(str[0],"rover.25O")},{strcat(str[1],"rover.25P")}};
+    char* infile[3] = { {strcat(str[0],"rover.24O")},{strcat(str[1],"base.24P")}};
     char outfile[256] = "";
-    infile[2] = strcat(str[3],"base.25O");
+    infile[2] = strcat(str[3],"base.24O");
     strcpy(outfile, resultpath);
     strcat(outfile, str_envir);
     strcat(outfile, "test.pos");
@@ -142,8 +142,8 @@ int main(int argc,char *argv)
     
 #ifdef ENABLE_RTK_INTEGRITY
     /* Integrity master switches */
-    prcopt.enable_rtk_integrity_monitor = 1;
-    prcopt.enable_rtk_integrity_rbias_export = 0;
+    prcopt.enable_rtk_integrity_monitor = 0;
+    prcopt.enable_rtk_integrity_rbias_export = 1;
 
     /* Monitored fault modes */
     prcopt.enable_monitor_single_satellite_fault = 1;

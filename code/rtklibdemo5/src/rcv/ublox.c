@@ -1002,7 +1002,7 @@ static int decode_cnav(raw_t *raw, int sat, int off)
         trace(2,"ubx rawsfrbx subfrm id error: sat=%2d\n",sat);
         return -1;
     }
-    if (prn>5&&prn<59) { /* IGSO/MEO */
+    if (!BDS_GEO_PRN(prn)) { /* IGSO/MEO */
         
         for (i=0;i<10;i++) {
             setbitu(raw->subfrm[sat-1]+(id-1)*38,i*30,30,words[i]);
@@ -1012,7 +1012,7 @@ static int decode_cnav(raw_t *raw, int sat, int off)
         /* decode beidou D1 ephemeris */
         if (!decode_bds_d1(raw->subfrm[sat-1],&eph)) return 0;
     }
-    else { /* GEO (C01-05, C59-63) */
+    else { /* GEO */
         if (id!=1) return 0;
         
         /* subframe 1 */

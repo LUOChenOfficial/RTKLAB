@@ -51,7 +51,7 @@ static double varerr(const prcopt_t *opt, double el, int prn, int sys)
     a = fact * opt->err[1];
     b = fact * opt->err[2];
     fact = (opt->ionoopt == IONOOPT_IFLC) ? SQR(3.0) : 1.0;
-    if (sys == SYS_CMP && (prn <= 5 || prn >= 59)) fact *= 3;
+    if (sys == SYS_CMP && BDS_GEO_PRN(prn)) fact *= 3;
     return fact * ( SQR(a) + SQR(b / sinel) );
 }
 /* get tgd parameter (m) -----------------------------------------------------*/

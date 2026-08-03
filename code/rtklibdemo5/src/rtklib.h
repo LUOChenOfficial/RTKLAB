@@ -54,6 +54,18 @@
 #ifndef ENABLE_RTK_SKIP_EPOCH
 #define ENABLE_RTK_SKIP_EPOCH 0
 #endif
+#ifndef ENABLE_BDS_NEW_DATA
+#define ENABLE_BDS_NEW_DATA 1 /* 1: BDS-3-reorganized data */
+#endif
+#if ENABLE_BDS_NEW_DATA
+#define BDS_GEO_PRN(prn)              ((prn)>=1&&(prn)<=4)
+#define BDS_GEO_FALLBACK_PRN(prn)     BDS_GEO_PRN(prn)
+#define BDS_EXCLUDE_OBS_PRN(prn)      ((prn)==9||(prn)==10)
+#else
+#define BDS_GEO_PRN(prn)              ((prn)>=59&&(prn)<=62)
+#define BDS_GEO_FALLBACK_PRN(prn)     BDS_GEO_PRN(prn)
+#define BDS_EXCLUDE_OBS_PRN(prn)      ((prn)<19)
+#endif
 #ifndef ENABLE_RTK_ARAIM_PL_BIAS_TERM
 #define ENABLE_RTK_ARAIM_PL_BIAS_TERM 1
 #endif
