@@ -51,11 +51,20 @@
 #ifndef ENABLE_RTK_DEBUG_OUTPUT
 #define ENABLE_RTK_DEBUG_OUTPUT 1
 #endif
+#ifndef ENABLE_RTK_ONLINE_MC
+#define ENABLE_RTK_ONLINE_MC 1
+#endif
+#ifndef RTK_ONLINE_MC_SAMPLES
+#define RTK_ONLINE_MC_SAMPLES 10000
+#endif
+#ifndef RTK_ONLINE_MC_RATIO
+#define RTK_ONLINE_MC_RATIO 3.0
+#endif
 #ifndef ENABLE_RTK_SKIP_EPOCH
 #define ENABLE_RTK_SKIP_EPOCH 0
 #endif
 #ifndef ENABLE_BDS_NEW_DATA
-#define ENABLE_BDS_NEW_DATA 1 /* 1: BDS-3-reorganized data */
+#define ENABLE_BDS_NEW_DATA 0 /* 1: BDS-3-reorganized data */
 #endif
 #if ENABLE_BDS_NEW_DATA
 #define BDS_GEO_PRN(prn)              ((prn)>=1&&(prn)<=4)
@@ -2023,6 +2032,16 @@ EXPORT void rtk_debug_rawline(const char *stage, gtime_t time,
                               int decoded_sat, int ok);
 EXPORT void rtk_debug_counts(const rtk_t *rtk, const char *stage,
                              int nobs, int nu, int nr);
+EXPORT void rtk_debug_ambfix(gtime_t time, float ratio, float threshold,
+                             int dd_index, int dd_count, const char *refsat,
+                             const char *sat, int freq, double float_cycles,
+                             double integer_cycles);
+EXPORT void rtk_debug_ambtruth(gtime_t time, const char *refsat,
+                               const char *sat, int freq, double truth_cycles);
+EXPORT void rtk_debug_float_amb(gtime_t time, int nb, const double *amb,
+                                const double *Q);
+EXPORT void rtk_debug_mc_epoch(gtime_t time, int na, int nb, const double *Qab,
+                               const double *Q, int samples, double ratio_threshold);
 EXPORT void rtk_debug_valtest(gtime_t time, const char *stage, int solstat,
                               float ratio, int nv, int np, int dof,
                               double chi2, double chi2_thres, int pass,

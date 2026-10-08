@@ -536,10 +536,6 @@ static void procpos(FILE *fp, FILE *fptm, const prcopt_t *popt, const solopt_t *
     rtcm_path[0]='\0';
     
     while ((nobs=inputobs(obs,rtk->sol.stat,popt))>=0) {
-        /*鏁寸澶勭悊*/
-        if (obs[0].time.sec > 0.09) {
-            continue;
-        }
 #if ENABLE_RTK_SKIP_EPOCH
         nobs=apply_skip_epoch_experiment(obs,nobs,popt);
         if (nobs<0) continue;

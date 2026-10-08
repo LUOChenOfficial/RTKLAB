@@ -2153,6 +2153,143 @@ static int ddmat(rtk_t* rtk, double* D)
 	}
 	return nb;
 }
+
+/* write the DD ambiguities of an accepted LAMBDA candidate to .rtk_debug */
+static void debug_fixed_dd_ambiguities(const rtk_t *rtk, const double *D,
+	const double *float_dd, const double *integer_dd, int nb)
+{
+	int col, state, f, sat, ref_state, sat_state, ref_freq, sat_freq;
+	char ref_id[16], sat_id[16];
+
+	for (col=0;col<nb;col++) {
+		ref_state=sat_state=-1;
+		ref_freq=sat_freq=-1;
+		ref_id[0]=sat_id[0]='\0';
+		for (state=rtk->na;state<rtk->nx;state++) {
+			double d=D[state+(rtk->na+col)*rtk->nx];
+			if (d>0.5) ref_state=state;
+			else if (d<-0.5) sat_state=state;
+		}
+		if (ref_state<0||sat_state<0) continue;
+		for (f=0;f<NF(&rtk->opt);f++) {
+			for (sat=1;sat<=MAXSAT;sat++) {
+				if (IB(sat,f,&rtk->opt)==ref_state) {
+					satno2id(sat,ref_id); ref_freq=f;
+				}
+				if (IB(sat,f,&rtk->opt)==sat_state) {
+					satno2id(sat,sat_id); sat_freq=f;
+				}
+			}
+		}
+		if (ref_freq<0||ref_freq!=sat_freq) continue;
+		rtk_debug_ambfix(rtk->sol.time,rtk->sol.ratio,rtk->sol.thres,
+			col+1,nb,ref_id,sat_id,ref_freq+1,float_dd[col],integer_dd[col]);
+	}
+}
+
+/* Export DD ambiguities only after the final solution status is fixed. */
+static void debug_final_fixed_dd_ambiguities(rtk_t *rtk, const double *xa)
+{
+	int i, col, nb, nx=rtk->nx, na=rtk->na;
+	double *D=zeros(nx,nx), *float_dd, *integer_dd;
+
+	if (!D) return;
+	if ((nb=ddmat(rtk,D))<=0) {
+		free(D);
+		return;
+	}
+	float_dd=zeros(nb,1);
+	integer_dd=zeros(nb,1);
+	if (!float_dd||!integer_dd) {
+		free(D); free(float_dd); free(integer_dd);
+		return;
+	}
+	for (col=0;col<nb;col++) {
+		for (i=0;i<nx;i++) {
+			double d=D[i+(na+col)*nx];
+			float_dd[col]+=d*rtk->x[i];
+			integer_dd[col]+=d*xa[i];
+		}
+		/* xa can retain a held DD as a float value; export its final integer. */
+		integer_dd[col]=ROUND(integer_dd[col]);
+	}
+	debug_fixed_dd_ambiguities(rtk,D,float_dd,integer_dd,nb);
+	free(D); free(float_dd); free(integer_dd);
+}
+
+/* Cached valid KSXT rover truth coordinates for high-rate diagnostics. */
+#define STATIC_TRUTH_MAX 30000
+static gtime_t static_truth_times[STATIC_TRUTH_MAX];
+static double static_truth_xyz[STATIC_TRUTH_MAX*3];
+static int static_truth_count=-1;
+
+/* Load the nearest valid KSXT rover truth coordinate for an epoch. */
+static int static_truth_position(gtime_t time, double *rr)
+{
+	const char *path="F:\\RTKLib-LAB\\result\\Static\\COM25-comB-1.dat";
+	FILE *fp;
+	char buff[512], stamp[32];
+	double lon,lat,h,best=1E9,pos[3],ep[6];
+	gtime_t t;
+	int year,month,day,hour,min,i,best_index=-1;
+	double sec;
+
+	if (static_truth_count<0) {
+		static_truth_count=0;
+		if (!(fp=fopen(path,"r"))) return 0;
+		while (fgets(buff,sizeof(buff),fp) && static_truth_count<STATIC_TRUTH_MAX) {
+			if (sscanf(buff,"$KSXT,%31[^,],%lf,%lf,%lf",stamp,&lon,&lat,&h)!=4 ||
+				fabs(lat)<1E-9 || fabs(lon)<1E-9) continue;
+			if (sscanf(stamp,"%4d%2d%2d%2d%2d%lf",&year,&month,&day,&hour,&min,&sec)!=6) continue;
+			ep[0]=year; ep[1]=month; ep[2]=day; ep[3]=hour; ep[4]=min; ep[5]=sec;
+			static_truth_times[static_truth_count]=epoch2time(ep);
+			pos[0]=lat*D2R; pos[1]=lon*D2R; pos[2]=h;
+			pos2ecef(pos,static_truth_xyz+static_truth_count*3);
+			static_truth_count++;
+		}
+		fclose(fp);
+	}
+	for (i=0;i<static_truth_count;i++) {
+		double diff=fabs(timediff(static_truth_times[i],time));
+		if (diff<best) { best=diff; best_index=i; }
+	}
+	if (best_index>=0) matcpy(rr,static_truth_xyz+best_index*3,3,1);
+	/* Do not reuse one truth epoch for several higher-rate observations. */
+	return best_index>=0 && best<=0.05;
+}
+
+/* Evaluate phase DD observations at the reference coordinate with ambiguity states zeroed. */
+static void debug_truth_constrained_dd_ambiguities(rtk_t *rtk, const nav_t *nav,
+	const obsd_t *obs, double dt, const int *sat, double *y, double *e,
+	double *azel, const int *iu, const int *ir, int ns)
+{
+	int i,nv,ny=ns*NF(&rtk->opt)*2+2, vflg[MAXOBS*NFREQ*2+1],numnv[4];
+	double rr[3],*x,*v,*R,lam;
+	char refid[16],satid[16];
+	ssat_t ssat[MAXSAT];
+
+	if (!static_truth_position(rtk->sol.time,rr)) return;
+	x=mat(rtk->nx,1); v=mat(ny,1); R=zeros(ny,ny);
+	if (!x||!v||!R) { free(x); free(v); free(R); return; }
+	matcpy(x,rtk->x,rtk->nx,1);
+	for (i=0;i<3;i++) x[i]=rr[i];
+	for (i=rtk->na;i<rtk->nx;i++) x[i]=0.0;
+	memcpy(ssat,rtk->ssat,sizeof(ssat));
+	memcpy(numnv,rtk->numnv,sizeof(numnv));
+	nv=ddres(rtk,nav,obs,dt,x,NULL,sat,y,e,azel,iu,ir,ns,v,NULL,R,vflg);
+	for (i=0;i<nv;i++) {
+		int ref=(vflg[i]>>16)&0xFF, target=(vflg[i]>>8)&0xFF;
+		int code=(vflg[i]>>4)&0xF, f=vflg[i]&0xF;
+		if (code) continue;
+		lam=nav->lam[ref-1][f];
+		if (lam<=0.0) continue;
+		satno2id(ref,refid); satno2id(target,satid);
+		rtk_debug_ambtruth(rtk->sol.time,refid,satid,f+1,v[i]/lam);
+	}
+	memcpy(rtk->ssat,ssat,sizeof(ssat));
+	memcpy(rtk->numnv,numnv,sizeof(numnv));
+	free(x); free(v); free(R);
+}
 /* translate double diff fixed phase-bias values to single diff fix phase-bias values */
 static void restamb(rtk_t* rtk, const double* bias, int nb, double* xa)
 {
@@ -2336,6 +2473,32 @@ static void holdamb(rtk_t* rtk, const double* xa)
 		}
 	}
 }
+/* Final ambiguity model retained for one Monte Carlo evaluation per epoch. */
+static int mc_final_nb=0;
+static int mc_final_na=0;
+static double mc_final_amb[MAXSAT*NFREQ]={0};
+static double mc_final_Q[MAXSAT*NFREQ*MAXSAT*NFREQ]={0};
+static double mc_final_Qab[MAXSAT*NFREQ*2*MAXSAT*NFREQ]={0};
+
+static void mc_cache_ambiguities(int nb, const double *amb, const double *Q)
+{
+	int i,j,maxn=MAXSAT*NFREQ;
+	if (nb<=0||nb>maxn||!amb||!Q) { mc_final_nb=0; return; }
+	mc_final_nb=nb;
+	for (i=0;i<nb;i++) mc_final_amb[i]=amb[i];
+	for (i=0;i<nb;i++) for (j=0;j<nb;j++)
+		mc_final_Q[i+j*nb]=Q[i+j*nb];
+}
+
+static void mc_cache_qab(int na, int nb, const double *Qab)
+{
+    int i,j;
+    if (!Qab||na<=0||nb<=0||na>MAXSAT*NFREQ*2||nb>MAXSAT*NFREQ) return;
+    mc_final_na=na;
+    for (i=0;i<na;i++) for (j=0;j<nb;j++)
+        mc_final_Qab[i+j*na]=Qab[i+j*na];
+}
+
 /* resolve integer ambiguity by LAMBDA ---------------------------------------*/
 static int resamb_LAMBDA(rtk_t* rtk, double* bias, double* xa)
 {
@@ -2395,6 +2558,11 @@ static int resamb_LAMBDA(rtk_t* rtk, double* bias, double* xa)
 		}
 	}
 	for (i = 0; i < na; i++) for (j = 0; j < nb; j++) Qab[i + j * na] = Qy[i + (na + j) * ny];
+
+	/* Export the exact float DD input and full covariance used by LAMBDA. */
+	rtk_debug_float_amb(rtk->sol.time, nb, y + na, Qb);
+	mc_cache_ambiguities(nb, y + na, Qb);
+	mc_cache_qab(na, nb, Qab);
 
 	trace(3, "N(0)=     "); tracemat(3, y + na, 1, nb, 7, 2);
 	trace(3, "Qb  =     "); tracemat(3, QQb, 1, nb, 7, 5);
@@ -2615,6 +2783,9 @@ static int resamb_LAMBDA_subset(rtk_t* rtk, const double* amb_f, const double* Q
 			Qab_sub[j + i * na] = Qab_full[j + idxs[i] * na];
 		}
 	}
+	/* Preserve the subset covariance before lambda/inversion changes it. */
+	mc_cache_ambiguities(nidx, a_sub, Qb_sub);
+	mc_cache_qab(na, nidx, Qab_sub);
 
 	if ((info = lambda(nidx, 2, a_sub, Qb_sub, b, s)) != 0) {
 		free(a_sub); free(Qb_sub); free(Qab_sub); free(b); free(db); free(QQ);
@@ -3244,6 +3415,15 @@ static int relpos(rtk_t* rtk, const obsd_t* obs, int nu, int nr,
 		}
 	}
 
+	if (stat==SOLQ_FIX) {
+		debug_final_fixed_dd_ambiguities(rtk,xa);
+		debug_truth_constrained_dd_ambiguities(rtk,nav,obs,dt,sat,y,e,azel,iu,ir,ns);
+		/* Evaluate only the ambiguity set that survived all final validation. */
+		if (ENABLE_RTK_ONLINE_MC && mc_final_nb > 0) {
+			rtk_debug_mc_epoch(rtk->sol.time,mc_final_na,mc_final_nb,mc_final_Qab,mc_final_Q,
+				RTK_ONLINE_MC_SAMPLES,RTK_ONLINE_MC_RATIO);
+		}
+	}
 	rtk->sol.test_sd = 0;//GJH20260316手动赋值，目的是不输出乱码
 
 

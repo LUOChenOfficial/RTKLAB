@@ -77,19 +77,29 @@ static void printhelp(void)
 
 
 /* 定位测试主函数 -------------------------------------------------------*/
-int main(int argc,char *argv) 
+int main(int argc,char **argv)
 {
 	gtime_t ts = { 0 }, te = { 0 };
 	prcopt_t prcopt = prcopt_default; 
 	solopt_t solopt = solopt_default;
 	filopt_t filopt={""};
-	double tint=1.0; //采样间隔记得改 
+	double tint=1.0; /* Use the requested 1 Hz processing rate. */
 	int n=3; //输入文件数
     char basepath[] = "F:\\RTKLib-LAB\\data";
     char resultpath[] = "F:\\RTKLib-LAB\\result";
 
-    //////////////////////////////////////////////////////注意更改文件夹
-    char str_envir[] = "\\Static\\";
+    ////////////////////////////////////////////////////// dataset: Static/Open/Wall/Tree
+    const char *env = "Static";
+    if (argc > 1) env = argv[1];
+    char str_envir[64];
+    char obs_ext[8], nav_ext[8];
+    snprintf(str_envir, sizeof(str_envir), "\\%s\\", env);
+    if (!strcmp(env, "Static")) {
+        strcpy(obs_ext, ".25O"); strcpy(nav_ext, ".25P");
+    }
+    else {
+        strcpy(obs_ext, ".21o"); strcpy(nav_ext, ".21p");
+    }
 
     char* str[5];
     for (int i = 0; i < 5; i++) {
@@ -98,13 +108,16 @@ int main(int argc,char *argv)
         str[i]= strcat(str[i], str_envir);
     }
 
-    //记得改文件名尤其是24/25O
-    char* infile[3] = { {strcat(str[0],"rover.24O")},{strcat(str[1],"base.24P")}};
+    char rover_name[64], nav_name[64], base_name[64];
+    snprintf(rover_name, sizeof(rover_name), "rover%s", obs_ext);
+    snprintf(nav_name, sizeof(nav_name), "rover%s", nav_ext);
+    snprintf(base_name, sizeof(base_name), "base%s", obs_ext);
+    char* infile[3] = { {strcat(str[0],rover_name)},{strcat(str[1],nav_name)}};
     char outfile[256] = "";
-    infile[2] = strcat(str[3],"base.24O");
+    infile[2] = strcat(str[3],base_name);
     strcpy(outfile, resultpath);
     strcat(outfile, str_envir);
-    strcat(outfile, "test.pos");
+    strcat(outfile, "test_ambfix.pos");
 
     //openmodel(strcat(str[4], "model_weight.txt"));
 
@@ -113,7 +126,7 @@ int main(int argc,char *argv)
 	/* Setting1 */
 	prcopt.mode = PMODE_KINEMA; /* {PMODE_SINGLE;PMODE_KINEMA; PMODE_DGPS;PMODE_STATIC} */
 	prcopt.nf= 2;  //频率
-    prcopt.elmin = 10 * D2R;//截止高度角（弧度）
+    prcopt.elmin = 15 * D2R; /* Match the GEOLIB Dynamic_GPSBDS cutoff angle. */
     //prcopt.weightmode=WEIGHTOPT_ELEVATION;
     prcopt.weightmode=WEIGHTOPT_SNR;
     //prcopt.weightmode = WEIGHTOPT_PLD;                   //包含PLD观测值才可以使用
@@ -126,6 +139,7 @@ int main(int argc,char *argv)
 	prcopt.ionoopt = IONOOPT_BRDC;
 	prcopt.tropopt = TROPOPT_SAAS;
 	prcopt.soltype = 0;
+	prcopt.intpref = 0;
     prcopt.navsys = SYS_GPS +SYS_CMP;
 
 	/* Setting2 */
@@ -143,7 +157,7 @@ int main(int argc,char *argv)
 #ifdef ENABLE_RTK_INTEGRITY
     /* Integrity master switches */
     prcopt.enable_rtk_integrity_monitor = 0;
-    prcopt.enable_rtk_integrity_rbias_export = 1;
+    prcopt.enable_rtk_integrity_rbias_export = 0;
 
     /* Monitored fault modes */
     prcopt.enable_monitor_single_satellite_fault = 1;
@@ -158,8 +172,8 @@ int main(int argc,char *argv)
     prcopt.rtk_integrity_debug_subset_id = 0;
     prcopt.rtk_integrity_debug_satellite = 0;
     prcopt.rtk_integrity_debug_pl_threshold = 0.0;
-    prcopt.rtk_integrity_false_alarm_prob = 1e-6;
-    prcopt.rtk_integrity_miss_detect_prob = 5e-8;
+    prcopt.rtk_integrity_false_alarm_prob = 1e-4;
+    prcopt.rtk_integrity_miss_detect_prob = 1e-3;
 #endif
 #if ENABLE_RTK_SKIP_EPOCH
     prcopt.rtk_skip_epoch_time[0] = 2021;
@@ -214,6 +228,7 @@ int main(int argc,char *argv)
 	solopt.sstat = 0;
 	solopt.trace = 0;
 
+	fprintf(stderr,"dataset=%s rover=%s nav=%s base=%s out=%s\n",env,infile[0],infile[1],infile[2],outfile);
 	postpos(ts, te, tint, 0.0, &prcopt, &solopt, &filopt, infile, n ,outfile, "", "");
     closemodel();
     // 释放内存

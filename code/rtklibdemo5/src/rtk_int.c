@@ -1136,36 +1136,13 @@ EXPORT void rtkim_detect(rtk_t *rtk, const obsd_t *obs, int nobs,
     mon->ep.fixed=rtk->sol.stat==SOLQ_FIX;
     mon->ep.fixed_upd=mon->ep.fixed;
 #if RTK_INT_METHOD==RTK_INT_METHOD_SLOPE
+    /* The slope method supplies PL only; it must not alter AR/FDE state. */
     mon->ndef=0;
     mon->nact=0;
     memset(&mon->fde,0,sizeof(mon->fde));
     memset(&mon->act,0,sizeof(mon->act));
     rtk->int_fde_mode=0;
     rtk->int_fde_sat=0;
-    if (rtk->opt.enable_rtk_integrity_fde_recovery&&rtk->sol.stat!=SOLQ_NONE&&
-        mon->bv&&mon->bR&&mon->bnv>3) {
-        double *W=mat(mon->bnv,mon->bnv),stat=0.0,thres=0.0;
-        int j,k,dof=mon->bnv-3;
-        if (W) {
-            matcpy(W,mon->bR,mon->bnv,mon->bnv);
-            if (!matinv(W,mon->bnv)) {
-                for (j=0;j<mon->bnv;j++) for (k=0;k<mon->bnv;k++) {
-                    stat+=mon->bv[j]*W[j+k*mon->bnv]*mon->bv[k];
-                }
-                if (dof>0) {
-                    thres=dof<=100?chisqr[dof-1]:chisqr[99];
-                    if (stat>thres) {
-                        mon->fde.mode=RTKIM_F_NFIX;
-                        mon->fde.score=thres>0.0?stat/thres:stat;
-                        mon->fde.act=RTKIM_A_FLOAT;
-                        mon->act=mon->fde;
-                        rtk->int_fde_mode=mon->fde.mode;
-                    }
-                }
-            }
-            free(W);
-        }
-    }
     return;
 #elif RTK_INT_METHOD==RTK_INT_METHOD_LS_SS
     if (rtk->opt.enable_monitor_single_satellite_fault) {
@@ -1357,6 +1334,20 @@ EXPORT int rtk_debug_open(const char *outfile)
             "%% RAWLINE time stage satid preset_sat decoded_sat ok\n");
         fprintf(fp_rtk_dbg,
             "%% SATSET time stage count sat_list\n");
+        fprintf(fp_rtk_dbg,
+            "%% AMB_FIX time ratio threshold dd_index dd_count ref_sat sat freq float_dd_cycles integer_dd_cycles residual_cycles\n");
+        fprintf(fp_rtk_dbg,
+            "%% AMB_TRUTH time ref_sat sat freq truth_constrained_dd_cycles\n");
+        fprintf(fp_rtk_dbg,
+            "%% AMB_FLOAT id time nb index float_dd_cycles\n");
+        fprintf(fp_rtk_dbg,
+            "%% AMB_COV id time nb row col q_cycles2\n");
+        fprintf(fp_rtk_dbg,
+            "%% MC_EPOCH id time nb samples ratio_threshold\n");
+        fprintf(fp_rtk_dbg,
+            "%% MC_MODE id time nb k1 ... kn count probability dx dy dz norm\n");
+        fprintf(fp_rtk_dbg,
+            "%% MC_RESULT id time nb samples accepted correct wrong acceptance_rate conditional_correct_rate\n");
     }
     setpath(path,outfile,".vtest");
     fp_vtest_dbg=fopen(path,"w");
@@ -1534,6 +1525,199 @@ EXPORT void rtk_debug_counts(const rtk_t *rtk, const char *stage,
     fflush(fp_rtk_dbg);
 #else
     (void)rtk; (void)stage; (void)nobs; (void)nu; (void)nr;
+#endif
+}
+
+EXPORT void rtk_debug_ambfix(gtime_t time, float ratio, float threshold,
+                             int dd_index, int dd_count, const char *refsat,
+                             const char *sat, int freq, double float_cycles,
+                             double integer_cycles)
+{
+#if ENABLE_RTK_DEBUG_OUTPUT
+    if (!fp_rtk_dbg) return;
+    fprintf(fp_rtk_dbg,
+        "AMB_FIX %s %.3f %.3f %d %d %s %s %d %.6f %.0f %.6f\n",
+        time_str(time,3),ratio,threshold,dd_index,dd_count,
+        refsat&&*refsat?refsat:"---",sat&&*sat?sat:"---",freq,
+        float_cycles,integer_cycles,float_cycles-integer_cycles);
+    fflush(fp_rtk_dbg);
+#else
+    (void)time; (void)ratio; (void)threshold; (void)dd_index; (void)dd_count;
+    (void)refsat; (void)sat; (void)freq; (void)float_cycles; (void)integer_cycles;
+#endif
+}
+
+EXPORT void rtk_debug_ambtruth(gtime_t time, const char *refsat,
+                               const char *sat, int freq, double truth_cycles)
+{
+#if ENABLE_RTK_DEBUG_OUTPUT
+    if (!fp_rtk_dbg) return;
+    fprintf(fp_rtk_dbg, "AMB_TRUTH %s %s %s %d %.6f\n", time_str(time,3),
+        refsat&&*refsat?refsat:"---", sat&&*sat?sat:"---", freq, truth_cycles);
+    fflush(fp_rtk_dbg);
+#else
+    (void)time; (void)refsat; (void)sat; (void)freq; (void)truth_cycles;
+#endif
+}
+
+/* Export the exact float DD ambiguity vector and covariance passed to LAMBDA. */
+EXPORT void rtk_debug_float_amb(gtime_t time, int nb, const double *amb,
+                                const double *Q)
+{
+#if ENABLE_RTK_DEBUG_OUTPUT
+    static unsigned long long seq = 0;
+    unsigned long long id = ++seq;
+    int i, j;
+    if (!fp_rtk_dbg || !amb || !Q || nb <= 0) return;
+    for (i = 0; i < nb; i++) {
+        fprintf(fp_rtk_dbg, "AMB_FLOAT %llu %s %d %d %.17g\n",
+            id, time_str(time,3), nb, i + 1, amb[i]);
+    }
+    for (i = 0; i < nb; i++) for (j = 0; j < nb; j++) {
+        fprintf(fp_rtk_dbg, "AMB_COV %llu %s %d %d %d %.17g\n",
+            id, time_str(time,3), nb, i + 1, j + 1, Q[i + j * nb]);
+    }
+    fflush(fp_rtk_dbg);
+#else
+    (void)time; (void)nb; (void)amb; (void)Q;
+#endif
+}
+
+/* Monte Carlo diagnostic for the final ambiguity set of one epoch. */
+static void rtk_debug_mc_epoch_legacy(gtime_t time, int nb, const double *Q,
+                                      int samples, double ratio_threshold)
+{
+#if ENABLE_RTK_DEBUG_OUTPUT && ENABLE_RTK_ONLINE_MC
+    double *L=NULL,*eta=NULL,*F=NULL,s[2],u1,u2,gauss;
+    int i,j,m,info,accepted=0,correct=0;
+    static unsigned long long seq=0;
+    unsigned long long id=++seq;
+    if (!fp_rtk_dbg||!Q||nb<=0||nb>MAXSAT*NFREQ||samples<=0) return;
+    L=zeros(nb,nb); eta=zeros(nb,1); F=zeros(nb,2);
+    if (!L||!eta||!F) { free(L); free(eta); free(F); return; }
+    matcpy(L,Q,nb,nb);
+    /* lower-triangular Cholesky factor L, Q=L*L' */
+    for (i=0;i<nb;i++) {
+        for (j=0;j<=i;j++) {
+            double v=L[i+j*nb];
+            int k;
+            for (k=0;k<j;k++) v-=L[i+k*nb]*L[j+k*nb];
+            if (i==j) {
+                if (v<=0.0) { free(L); free(eta); free(F); return; }
+                L[i+j*nb]=sqrt(v);
+            }
+            else L[i+j*nb]=v/L[j+j*nb];
+        }
+        for (j=i+1;j<nb;j++) L[i+j*nb]=0.0;
+    }
+    fprintf(fp_rtk_dbg,"MC_EPOCH %llu %s %d %d %.6g\n",
+        id,time_str(time,3),nb,samples,ratio_threshold);
+    for (m=0;m<samples;m++) {
+        for (i=0;i<nb;i++) {
+            double z=0.0;
+            for (j=0;j<=i;j++) {
+                u1=((double)rand()+1.0)/((double)RAND_MAX+2.0);
+                u2=((double)rand()+1.0)/((double)RAND_MAX+2.0);
+                gauss=sqrt(-2.0*log(u1))*cos(2.0*PI*u2);
+                z+=L[i+j*nb]*gauss;
+            }
+            eta[i]=z;
+        }
+        info=lambda(nb,2,eta,Q,F,s);
+        if (info||s[0]<=0.0||s[1]/s[0]<ratio_threshold) continue;
+        accepted++;
+        {
+            int iszero=1;
+            for (i=0;i<nb;i++) if (F[i]!=0.0) { iszero=0; break; }
+            if (iszero) correct++;
+        }
+        fprintf(fp_rtk_dbg,"MC_OFFSET %llu %d",id,m+1);
+        for (i=0;i<nb;i++) fprintf(fp_rtk_dbg," %.0f",F[i]);
+        fprintf(fp_rtk_dbg,"\n");
+    }
+    fprintf(fp_rtk_dbg,"MC_RESULT %llu %s %d %d %d %d %d %.17g %.17g\n",
+        id,time_str(time,3),nb,samples,accepted,correct,accepted-correct,
+        accepted/(double)samples,accepted?correct/(double)accepted:0.0);
+    fflush(fp_rtk_dbg);
+    free(L); free(eta); free(F);
+#else
+    (void)time; (void)nb; (void)Q; (void)samples; (void)ratio_threshold;
+#endif
+}
+
+EXPORT void rtk_debug_mc_epoch(gtime_t time, int na, int nb, const double *Qab,
+                              const double *Q, int samples, double ratio_threshold)
+{
+#if ENABLE_RTK_DEBUG_OUTPUT && ENABLE_RTK_ONLINE_MC
+    enum { MC_MAX_MODES = 20000 };
+    double *L=NULL,*eta=NULL,*F=NULL,*Qi=NULL,*dv=NULL,s[2];
+    int *modes=NULL,*counts=NULL,mode_n=0,i,j,m,info,accepted=0,correct=0;
+    static unsigned long long seq=0;
+    unsigned long long id=++seq;
+    if (!fp_rtk_dbg||!Q||nb<=0||nb>MAXSAT*NFREQ||samples<=0) return;
+    L=zeros(nb,nb); eta=zeros(nb,1); F=zeros(nb,2);
+    Qi=mat(nb,nb); dv=zeros(na>0?na:1,1);
+    modes=imat(nb,MC_MAX_MODES); counts=imat(1,MC_MAX_MODES);
+    if (!L||!eta||!F||!Qi||!dv||!modes||!counts) goto done;
+    matcpy(L,Q,nb,nb);
+    for (i=0;i<nb;i++) {
+      for (j=0;j<=i;j++) {
+        double v=L[i+j*nb]; int k;
+        for (k=0;k<j;k++) v-=L[i+k*nb]*L[j+k*nb];
+        if (i==j) { if (v<=0.0) goto done; L[i+j*nb]=sqrt(v); }
+        else L[i+j*nb]=v/L[j+j*nb];
+      }
+      for (j=i+1;j<nb;j++) L[i+j*nb]=0.0;
+    }
+    matcpy(Qi,Q,nb,nb);
+    if (matinv(Qi,nb)) goto done;
+    fprintf(fp_rtk_dbg,"MC_EPOCH %llu %s %d %d %.6g\n",
+        id,time_str(time,3),nb,samples,ratio_threshold);
+    for (m=0;m<samples;m++) {
+        for (i=0;i<nb;i++) {
+            double z=0.0,u1,u2,g;
+            for (j=0;j<=i;j++) {
+                u1=((double)rand()+1.0)/((double)RAND_MAX+2.0);
+                u2=((double)rand()+1.0)/((double)RAND_MAX+2.0);
+                g=sqrt(-2.0*log(u1))*cos(2.0*PI*u2);
+                z+=L[i+j*nb]*g;
+            }
+            eta[i]=z;
+        }
+        info=lambda(nb,2,eta,Q,F,s);
+        if (info||s[0]<=0.0||s[1]/s[0]<ratio_threshold) continue;
+        accepted++;
+        for (i=0;i<mode_n;i++) {
+            int same=1; for (j=0;j<nb;j++) if (modes[j+i*nb]!=(int)F[j]) {same=0;break;}
+            if (same) break;
+        }
+        if (i==mode_n && mode_n<MC_MAX_MODES) {
+            for (j=0;j<nb;j++) modes[j+mode_n*nb]=(int)F[j];
+            counts[mode_n]=1; mode_n++;
+        }
+        else if (i<mode_n) counts[i]++;
+        if (mode_n>0) { int zero=1; for (j=0;j<nb;j++) if (F[j]!=0.0) zero=0; if (zero) correct++; }
+    }
+    for (i=0;i<mode_n;i++) {
+        double dx=0.0,dy=0.0,dz=0.0,norm=0.0;
+        if (Qab&&na>0) for (j=0;j<na;j++) {
+            int k; dv[j]=0.0;
+            for (k=0;k<nb;k++) for (m=0;m<nb;m++) dv[j]-=Qab[j+k*na]*Qi[k+m*nb]*modes[m+i*nb];
+            if (j==0) dx=dv[j]; else if (j==1) dy=dv[j]; else if (j==2) dz=dv[j];
+        }
+        norm=sqrt(dx*dx+dy*dy+dz*dz);
+        fprintf(fp_rtk_dbg,"MC_MODE %llu %s %d",id,time_str(time,3),nb);
+        for (j=0;j<nb;j++) fprintf(fp_rtk_dbg," %d",modes[j+i*nb]);
+        fprintf(fp_rtk_dbg," %d %.17g %.17g %.17g %.17g %.17g\n",counts[i],counts[i]/(double)samples,dx,dy,dz,norm);
+    }
+    fprintf(fp_rtk_dbg,"MC_RESULT %llu %s %d %d %d %d %d %.17g %.17g\n",
+        id,time_str(time,3),nb,samples,accepted,correct,accepted-correct,
+        accepted/(double)samples,accepted?correct/(double)accepted:0.0);
+    fflush(fp_rtk_dbg);
+done:
+    free(L); free(eta); free(F); free(Qi); free(dv); free(modes); free(counts);
+#else
+    (void)time; (void)na; (void)nb; (void)Qab; (void)Q; (void)samples; (void)ratio_threshold;
 #endif
 }
 
