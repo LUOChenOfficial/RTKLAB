@@ -1004,7 +1004,7 @@ static int readrnxobsb(FILE *fp, const char *opt, double ver, int *tsys,
             {
                 int ok=decode_obsdata(fp,buff,ver,mask,index,data+n);
                 if (time.time==gpst2time(2143,381459.0).time&&fabs(time.sec-gpst2time(2143,381459.0).sec)<1E-6) {
-                    rtk_debug_rawline("rinex_obs",time,satid,sats[i-1],data[n].sat,ok);
+                    rtkdbgrawline("rinex_obs",time,satid,sats[i-1],data[n].sat,ok);
                 }
                 if (ok&&n<MAXOBS) n++;
             }

@@ -1,4 +1,9 @@
-﻿#include "rtklib.h"
+﻿/*------------------------------------------------------------------------------
+* rtk_int.c : RTK integrity lifecycle and solution separation
+*
+* notes  : DD model capture, FILTER_SS/LS_SS, FDE and monitor output.
+*-----------------------------------------------------------------------------*/
+#include "rtk_int_internal.h"
 
 #ifdef ENABLE_RTK_INTEGRITY
 
@@ -11,82 +16,17 @@
 #define NL_(opt)     ((opt)->glomodear!=GLO_ARMODE_AUTOCAL?0:NFREQGLO)
 #define NR_(opt)     (NP_(opt)+NI_(opt)+NT_(opt)+NL_(opt))
 #define IB_(s,f,opt) (NR_(opt)+MAXSAT*(f)+(s)-1)
-#define RTKINT_DEFAULT_PFA 1e-6
-#define RTKINT_DEFAULT_PMD 5e-8
 
 static FILE *fp_pint=NULL,*fp_pld=NULL,*fp_sub=NULL,*fp_rbias=NULL;
-#if ENABLE_RTK_DEBUG_OUTPUT
-static FILE *fp_rtk_dbg=NULL;
-static FILE *fp_vtest_dbg=NULL;
-#endif
-static int out_sub=0,out_rbias=0;
-static char rbias_path_hint[1024]="";
+static FILE *fp_gls=NULL;
+static FILE *fp_glsmode=NULL;
+static int outsub=0,outbias=0;
+static char rbiaspath[1024]="";
 
 #if ENABLE_RTK_ARAIM_PL_BIAS_TERM
-static int calcbiasenu(rtk_t *rtk, double *be, double *bn, double *bu, int *rows);
+static int calcbiasenu(rtk_t *rtk, double *be, double *bn, double *bu,
+                       int *rows);
 #endif
-
-static double clamp_prob(double p, double def)
-{
-    return p>0.0&&p<1.0?p:def;
-}
-
-static double norminv(double p)
-{
-    static const double a[]={
-        -3.969683028665376e+01, 2.209460984245205e+02,
-        -2.759285104469687e+02, 1.383577518672690e+02,
-        -3.066479806614716e+01, 2.506628277459239e+00
-    };
-    static const double b[]={
-        -5.447609879822406e+01, 1.615858368580409e+02,
-        -1.556989798598866e+02, 6.680131188771972e+01,
-        -1.328068155288572e+01
-    };
-    static const double c[]={
-        -7.784894002430293e-03, -3.223964580411365e-01,
-        -2.400758277161838e+00, -2.549732539343734e+00,
-        4.374664141464968e+00, 2.938163982698783e+00
-    };
-    static const double d[]={
-        7.784695709041462e-03, 3.224671290700398e-01,
-        2.445134137142996e+00, 3.754408661907416e+00
-    };
-    double q,r;
-    if (p<=0.0) return -1E9;
-    if (p>=1.0) return 1E9;
-    if (p<0.02425) {
-        q=sqrt(-2.0*log(p));
-        return (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5])/
-               ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1.0);
-    }
-    if (p>1.0-0.02425) {
-        q=sqrt(-2.0*log(1.0-p));
-        return -(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5])/
-                ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1.0);
-    }
-    q=p-0.5;
-    r=q*q;
-    return (((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r+a[5])*q/
-           ((((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r)+1.0);
-}
-
-static void integrity_thresholds(const prcopt_t *opt, int nset,
-                                 double *kmain, double *ksub, double *kss)
-{
-    double pfa=clamp_prob(opt?opt->rtk_integrity_false_alarm_prob:0.0,
-                          RTKINT_DEFAULT_PFA);
-    double pmd=clamp_prob(opt?opt->rtk_integrity_miss_detect_prob:0.0,
-                          RTKINT_DEFAULT_PMD);
-    double kfa=norminv(1.0-pfa*0.5);
-    double kmd=norminv(1.0-pmd*0.5);
-    double kss_pfa;
-    if (nset<=0) nset=1;
-    kss_pfa=clamp_prob(pfa/(4.0*nset),RTKINT_DEFAULT_PFA/4.0);
-    if (kmain) *kmain=kfa;
-    if (ksub)  *ksub =kmd;
-    if (kss)   *kss  =norminv(1.0-kss_pfa);
-}
 
 #if ENABLE_RTK_ARAIM_PL_BIAS_TERM
 typedef struct {
@@ -95,25 +35,16 @@ typedef struct {
     int count;
 } rbiasp_t;
 static rbiasp_t *rbiasp=NULL;
-static int nrbiasp=0,rbias_loaded=0,rbias_try=0;
+static int nrbiasp=0,rbiasload=0,rbiastry=0;
 #endif
-
-static void sigenu(const double *rr, const double *qr, double *sig)
-{
-    double pos[3],q[9],qe[9];
-    ecef2pos(rr,pos);
-    q[0]=qr[0]; q[4]=qr[1]; q[8]=qr[2];
-    q[1]=q[3]=qr[3]; q[5]=q[7]=qr[4]; q[2]=q[6]=qr[5];
-    covenu(pos,q,qe);
-    sig[0]=SQRT_(qe[0]);
-    sig[1]=SQRT_(qe[4]);
-    sig[2]=SQRT_(qe[8]);
-}
 
 static void sepenu(const double *base, const double *pos, double *sep)
 {
     double bl[3],llh[3],E[9];
-    bl[0]=pos[0]-base[0]; bl[1]=pos[1]-base[1]; bl[2]=pos[2]-base[2];
+
+    bl[0]=pos[0]-base[0];
+    bl[1]=pos[1]-base[1];
+    bl[2]=pos[2]-base[2];
     ecef2pos(base,llh);
     xyz2enu(llh,E);
     matmul("NN",3,1,3,1.0,E,bl,0.0,sep);
@@ -121,41 +52,41 @@ static void sepenu(const double *base, const double *pos, double *sep)
 
 static void qr2cov(const float *qr, double *q)
 {
-    q[0]=qr[0]; q[1]=qr[1]; q[2]=qr[2];
-    q[3]=qr[3]; q[4]=qr[4]; q[5]=qr[5];
-}
-
-static int satfromvflg(int vflg)
-{
-    int su=(vflg>>8)&0xFF;
-    int sf=(vflg>>16)&0xFF;
-    return su>0?su:sf;
+    q[0]=qr[0];
+    q[1]=qr[1];
+    q[2]=qr[2];
+    q[3]=qr[3];
+    q[4]=qr[4];
+    q[5]=qr[5];
 }
 
 static int satinrow(int vflg, int sat)
 {
     int su=(vflg>>8)&0xFF;
     int sf=(vflg>>16)&0xFF;
+
     return sat>0&&(su==sat||sf==sat);
 }
 
-static int lsq_dd_model(const rtk_t *rtk, int excl_sat, double *qecef,
-                        double *sigenu_out, double *xenu, int *nrow)
+static int lsqdd(const rtk_t *rtk, int exsat, double *Qpos, double *sig,
+                 double *xenu, int *nrow)
 {
     const rtkim_t *mon=&rtk->intg;
-    double pos[3],E[9],qtmp[6],*Hpos=NULL,*Rsub=NULL,*W=NULL,*F=NULL,*N=NULL,*u=NULL,*vsub=NULL;
+    double pos[3],E[9],qtmp[6],*Hpos=NULL,*Rsub=NULL,*W=NULL,
+                                  *F=NULL,*N=NULL,*u=NULL,
+                                  *vsub=NULL;
     int i,j,m=0,*rows=NULL,ok=0;
 
     if (nrow) *nrow=0;
-    if (xenu) memset(xenu,0,sizeof(double)*3);
-    if (sigenu_out) memset(sigenu_out,0,sizeof(double)*3);
-    if (qecef) memset(qecef,0,sizeof(double)*9);
+    if (xenu) memset(xenu,0,sizeof(double) *3);
+    if (sig) memset(sig,0,sizeof(double) *3);
+    if (Qpos) memset(Qpos,0,sizeof(double) *9);
     if (!mon->bH||!mon->bR||!mon->bv||mon->bnv<=0||mon->bnx<3) return 0;
 
     rows=(int *)malloc(sizeof(int)*mon->bnv);
     if (!rows) return 0;
     for (i=0;i<mon->bnv;i++) {
-        if (satinrow(mon->bflg[i],excl_sat)) continue;
+        if (satinrow(mon->bflg[i],exsat)) continue;
         rows[m++]=i;
     }
     if (nrow) *nrow=m;
@@ -172,7 +103,13 @@ static int lsq_dd_model(const rtk_t *rtk, int excl_sat, double *qecef,
     vsub=mat(m,1);
     if (!Hpos||!Rsub||!W||!F||!N||!u||!vsub) {
         free(rows);
-        free(Hpos); free(Rsub); free(W); free(F); free(N); free(u); free(vsub);
+        free(Hpos);
+        free(Rsub);
+        free(W);
+        free(F);
+        free(N);
+        free(u);
+        free(vsub);
         return 0;
     }
     for (j=0;j<m;j++) {
@@ -194,13 +131,13 @@ static int lsq_dd_model(const rtk_t *rtk, int excl_sat, double *qecef,
         u[i]=0.0;
         for (j=0;j<m;j++) u[i]+=F[i+j*3]*vsub[j];
     }
-    if (xenu||qecef||sigenu_out) {
+    if (xenu||Qpos||sig) {
         double xecef[3]={0};
         for (i=0;i<3;i++) {
             for (j=0;j<3;j++) xecef[i]+=N[i+j*3]*u[j];
         }
-        if (qecef) {
-            for (i=0;i<9;i++) qecef[i]=N[i];
+        if (Qpos) {
+            for (i=0;i<9;i++) Qpos[i]=N[i];
         }
         qtmp[0]=N[0];
         qtmp[1]=N[4];
@@ -208,7 +145,7 @@ static int lsq_dd_model(const rtk_t *rtk, int excl_sat, double *qecef,
         qtmp[3]=N[1];
         qtmp[4]=N[5];
         qtmp[5]=N[2];
-        if (sigenu_out) sigenu(rtk->sol.rr,qtmp,sigenu_out);
+        if (sig) rtkimsigenu(rtk->sol.rr,qtmp,sig);
         if (xenu) {
             ecef2pos(rtk->sol.rr,pos);
             xyz2enu(pos,E);
@@ -220,23 +157,31 @@ static int lsq_dd_model(const rtk_t *rtk, int excl_sat, double *qecef,
     ok=1;
 done:
     free(rows);
-    free(Hpos); free(Rsub); free(W); free(F); free(N); free(u); free(vsub);
+    free(Hpos);
+    free(Rsub);
+    free(W);
+    free(F);
+    free(N);
+    free(u);
+    free(vsub);
     return ok;
 }
 
-static int build_ls_subsets(rtk_t *rtk, double *msig_out, double *mainenu_out)
+static int lssubsets(rtk_t *rtk, double *sig, double *xenu)
 {
     rtkim_t *mon=&rtk->intg;
-    double msig[3]={0},mainenu[3]={0};
+    double msig[3]={0},enu[3]={0};
     int i,k,nrow=0,nvalid=0;
 
-    if (msig_out) memset(msig_out,0,sizeof(double)*3);
-    if (mainenu_out) memset(mainenu_out,0,sizeof(double)*3);
+    if (sig) memset(sig,0,sizeof(double) *3);
+    if (xenu) memset(xenu,0,sizeof(double) *3);
     mon->nact=0;
     for (i=0;i<mon->ndef;i++) memset(&mon->ss[i],0,sizeof(mon->ss[i]));
-    if (!lsq_dd_model(rtk,0,NULL,msig,mainenu,&nrow)) return 0;
-    if (msig_out) for (i=0;i<3;i++) msig_out[i]=msig[i];
-    if (mainenu_out) for (i=0;i<3;i++) mainenu_out[i]=mainenu[i];
+    if (!lsqdd(rtk,0,NULL,msig,enu,&nrow)) return 0;
+    if (sig)
+        for (i=0;i<3;i++) sig[i]=msig[i];
+    if (xenu)
+        for (i=0;i<3;i++) xenu[i]=enu[i];
 
     for (i=0;i<mon->ndef;i++) {
         rtkim_def_t *def=mon->def+i;
@@ -244,14 +189,14 @@ static int build_ls_subsets(rtk_t *rtk, double *msig_out, double *mainenu_out)
         double ssig[3]={0},subenu[3]={0};
         if (def->mode!=RTKIM_F_SAT||def->sat<=0) continue;
         ss->act=1;
-        if (!lsq_dd_model(rtk,def->sat,NULL,ssig,subenu,&nrow)) continue;
+        if (!lsqdd(rtk,def->sat,NULL,ssig,subenu,&nrow)) continue;
         ss->ready=1;
         ss->valid=1;
         ss->qi=rtk->sol.stat;
         ss->ratio=rtk->sol.ratio;
         for (k=0;k<3;k++) {
             ss->sig[k]=ssig[k];
-            ss->sep[k]=mainenu[k]-subenu[k];
+            ss->sep[k]=enu[k]-subenu[k];
         }
         nvalid++;
     }
@@ -259,120 +204,7 @@ static int build_ls_subsets(rtk_t *rtk, double *msig_out, double *mainenu_out)
     return 1;
 }
 
-static void calcpl_slope(rtk_t *rtk)
-{
-    rtkim_t *mon=&rtk->intg;
-    rtkim_pl_t *pl=&mon->pl;
-    double qmain[6],msig[3],kmain=0.0,ksub=0.0,kss=0.0;
-    double P[9],pos[3],E[9],*F=NULL,*Q=NULL,*Qinv=NULL,*Kecef=NULL,*Kenu=NULL,*A=NULL,*S=NULL;
-    double hsmax=0.0,vsmax=0.0,pbias=0.0,sigmab=0.0;
-    int i,j,k,n=mon->bnv,ih=-1,iv=-1;
-
-    memset(pl,0,sizeof(*pl));
-    if (n<=0||!mon->bH||!mon->bR||!rtk->x||!rtk->P||rtk->nx<3) {
-        rtk->int_hpl=0.0;
-        rtk->int_vpl=0.0;
-        return;
-    }
-    integrity_thresholds(&rtk->opt,n,&kmain,&ksub,&kss);
-    qmain[0]=rtk->P[0];
-    qmain[1]=rtk->P[1+rtk->nx];
-    qmain[2]=rtk->P[2+2*rtk->nx];
-    qmain[3]=rtk->P[1];
-    qmain[4]=rtk->P[2+rtk->nx];
-    qmain[5]=rtk->P[2];
-    sigenu(rtk->x,qmain,msig);
-    for (i=0;i<3;i++) pl->msig[i]=msig[i];
-
-    P[0]=rtk->P[0];             P[1]=rtk->P[1];             P[2]=rtk->P[2];
-    P[3]=rtk->P[rtk->nx];       P[4]=rtk->P[1+rtk->nx];     P[5]=rtk->P[2+rtk->nx];
-    P[6]=rtk->P[2*rtk->nx];     P[7]=rtk->P[1+2*rtk->nx];   P[8]=rtk->P[2+2*rtk->nx];
-
-    ecef2pos(rtk->x,pos);
-    xyz2enu(pos,E);
-
-    F=mat(3,n);
-    Q=mat(n,n);
-    Qinv=mat(n,n);
-    Kecef=mat(3,n);
-    Kenu=mat(3,n);
-    A=eye(n);
-    S=mat(n,n);
-    if (!F||!Q||!Qinv||!Kecef||!Kenu||!A||!S) {
-        free(F); free(Q); free(Qinv); free(Kecef); free(Kenu); free(A); free(S);
-        rtk->int_hpl=0.0;
-        rtk->int_vpl=0.0;
-        return;
-    }
-    for (j=0;j<n;j++) {
-        for (i=0;i<3;i++) {
-            F[i+j*3]=0.0;
-            for (k=0;k<3;k++) F[i+j*3]+=P[i+k*3]*mon->bH[k+j*mon->bnx];
-        }
-    }
-    for (j=0;j<n;j++) for (i=0;i<n;i++) {
-        double s=mon->bR[i+j*n];
-        for (k=0;k<3;k++) s+=mon->bH[k+i*mon->bnx]*F[k+j*3];
-        Q[i+j*n]=s;
-    }
-    matcpy(Qinv,Q,n,n);
-    if (!matinv(Qinv,n)) {
-        matmul("NN",3,n,n,1.0,F,Qinv,0.0,Kecef);
-        for (j=0;j<n;j++) {
-            for (i=0;i<3;i++) {
-                Kenu[i+j*3]=0.0;
-                for (k=0;k<3;k++) Kenu[i+j*3]+=E[i+k*3]*Kecef[k+j*3];
-            }
-        }
-        for (j=0;j<n;j++) for (i=0;i<n;i++) {
-            double hk=0.0;
-            for (k=0;k<3;k++) hk+=mon->bH[k+i*mon->bnx]*Kecef[k+j*3];
-            A[i+j*n]-=hk;
-        }
-        matmul("TN",n,n,n,1.0,A,A,0.0,S);
-        for (j=0;j<n;j++) {
-            double sii=S[j+j*n],hs,vs;
-            if (sii<=0.0) continue;
-            hs=SQRT_(SQR_(Kenu[0+j*3])+SQR_(Kenu[1+j*3]))/sqrt(sii);
-            vs=fabs(Kenu[2+j*3])/sqrt(sii);
-            if (hs>hsmax) {
-                hsmax=hs;
-                ih=j;
-            }
-            if (vs>vsmax) {
-                vsmax=vs;
-                iv=j;
-            }
-        }
-        if (ih>=0) {
-            for (j=0;j<n;j++) sigmab+=mon->bR[ih+j*n];
-            sigmab=SQRT_(fabs(sigmab));
-            pbias=kss*sigmab;
-            pl->hsrc=ih+1;
-            pl->hsat=satfromvflg(mon->bflg[ih]);
-            pl->hmode=RTKIM_F_SAT;
-        }
-        if (iv>=0) {
-            pl->vsrc=iv+1;
-            pl->vsat=satfromvflg(mon->bflg[iv]);
-            pl->vmode=RTKIM_F_SAT;
-        }
-        pl->hpl0=hsmax*pbias;
-        pl->vpl0=vsmax*pbias;
-    }
-    free(F); free(Q); free(Qinv); free(Kecef); free(Kenu); free(A); free(S);
-    pl->pe=pl->hpl0;
-    pl->pn=0.0;
-    pl->pu=pl->vpl0;
-    pl->hpl=pl->hpl0;
-    pl->vpl=pl->vpl0;
-    pl->hadd=pl->hpl-pl->hpl0;
-    pl->vadd=pl->vpl-pl->vpl0;
-    rtk->int_hpl=pl->hpl;
-    rtk->int_vpl=pl->vpl;
-}
-
-static void calcpl_ls(rtk_t *rtk)
+static void calcplls(rtk_t *rtk)
 {
     rtkim_t *mon=&rtk->intg;
     rtkim_pl_t *pl=&mon->pl;
@@ -382,16 +214,16 @@ static void calcpl_ls(rtk_t *rtk)
 
     memset(pl,0,sizeof(*pl));
     if (rtk->sol.stat!=SOLQ_FIX) {
-        rtk->int_hpl=0.0;
-        rtk->int_vpl=0.0;
+        rtk->inthpl=0.0;
+        rtk->intvpl=0.0;
         return;
     }
-    if (!build_ls_subsets(rtk,msig,NULL)) {
-        rtk->int_hpl=0.0;
-        rtk->int_vpl=0.0;
+    if (!lssubsets(rtk,msig,NULL)) {
+        rtk->inthpl=0.0;
+        rtk->intvpl=0.0;
         return;
     }
-    integrity_thresholds(&rtk->opt,mon->ndef,&kmain,&ksub,&kss);
+    rtkimthres(&rtk->opt,mon->ndef,&kmain,&ksub,&kss);
     for (i=0;i<3;i++) pl->msig[i]=msig[i];
     pe=kmain*msig[0];
     pn=kmain*msig[1];
@@ -401,7 +233,9 @@ static void calcpl_ls(rtk_t *rtk)
     for (i=0;i<mon->ndef;i++) {
         rtkim_def_t *def=mon->def+i;
         rtkim_ss_t *ss=mon->ss+i;
-        if (!ss->act||!ss->valid||def->mode!=RTKIM_F_SAT||def->sat<=0) continue;
+        if (!ss->act||!ss->valid||def->mode!=RTKIM_F_SAT||
+            def->sat<=0)
+            continue;
         for (k=0;k<3;k++) {
             ssig[k]=ss->sig[k];
             sep[k]=ss->sep[k];
@@ -410,22 +244,49 @@ static void calcpl_ls(rtk_t *rtk)
             sss=SQRT_(fabs(SQR_(ssig[k])-SQR_(msig[k])));
             subp=ksub*ssig[k]+kss*sss;
             if (k==0&&subp>pe) {
-                pe=subp; pl->hsrc=def->id; pl->hmode=def->mode; pl->hsat=def->sat;
-                pl->hsig[0]=ssig[0]; pl->hsig[1]=ssig[1]; pl->hsig[2]=ssig[2];
-                pl->hsss[0]=sss; pl->hsss[1]=0.0; pl->hsss[2]=0.0;
-                pl->hsep[0]=sep[0]; pl->hsep[1]=sep[1]; pl->hsep[2]=sep[2];
+                pe=subp;
+                pl->hsrc=def->id;
+                pl->hmode=def->mode;
+                pl->hsat=def->sat;
+                pl->hsig[0]=ssig[0];
+                pl->hsig[1]=ssig[1];
+                pl->hsig[2]=ssig[2];
+                pl->hsss[0]=sss;
+                pl->hsss[1]=0.0;
+                pl->hsss[2]=0.0;
+                pl->hsep[0]=sep[0];
+                pl->hsep[1]=sep[1];
+                pl->hsep[2]=sep[2];
             }
             if (k==1&&subp>pn) {
-                pn=subp; pl->hsrc=def->id; pl->hmode=def->mode; pl->hsat=def->sat;
-                pl->hsig[0]=ssig[0]; pl->hsig[1]=ssig[1]; pl->hsig[2]=ssig[2];
-                pl->hsss[0]=0.0; pl->hsss[1]=sss; pl->hsss[2]=0.0;
-                pl->hsep[0]=sep[0]; pl->hsep[1]=sep[1]; pl->hsep[2]=sep[2];
+                pn=subp;
+                pl->hsrc=def->id;
+                pl->hmode=def->mode;
+                pl->hsat=def->sat;
+                pl->hsig[0]=ssig[0];
+                pl->hsig[1]=ssig[1];
+                pl->hsig[2]=ssig[2];
+                pl->hsss[0]=0.0;
+                pl->hsss[1]=sss;
+                pl->hsss[2]=0.0;
+                pl->hsep[0]=sep[0];
+                pl->hsep[1]=sep[1];
+                pl->hsep[2]=sep[2];
             }
             if (k==2&&subp>pu) {
-                pu=subp; pl->vsrc=def->id; pl->vmode=def->mode; pl->vsat=def->sat;
-                pl->vsig[0]=ssig[0]; pl->vsig[1]=ssig[1]; pl->vsig[2]=ssig[2];
-                pl->vsss[0]=0.0; pl->vsss[1]=0.0; pl->vsss[2]=sss;
-                pl->vsep[0]=sep[0]; pl->vsep[1]=sep[1]; pl->vsep[2]=sep[2];
+                pu=subp;
+                pl->vsrc=def->id;
+                pl->vmode=def->mode;
+                pl->vsat=def->sat;
+                pl->vsig[0]=ssig[0];
+                pl->vsig[1]=ssig[1];
+                pl->vsig[2]=ssig[2];
+                pl->vsss[0]=0.0;
+                pl->vsss[1]=0.0;
+                pl->vsss[2]=sss;
+                pl->vsep[0]=sep[0];
+                pl->vsep[1]=sep[1];
+                pl->vsep[2]=sep[2];
             }
         }
     }
@@ -438,13 +299,14 @@ static void calcpl_ls(rtk_t *rtk)
     pl->vpl=pl->vpl0;
     pl->hadd=0.0;
     pl->vadd=0.0;
-    rtk->int_hpl=pl->hpl;
-    rtk->int_vpl=pl->vpl;
+    rtk->inthpl=pl->hpl;
+    rtk->intvpl=pl->vpl;
 }
 
 static void setpath(char *dst, const char *src, const char *ext)
 {
     char *p;
+
     strcpy(dst,src);
     if ((p=strrchr(dst,'.'))) *p='\0';
     strcat(dst,ext);
@@ -453,16 +315,18 @@ static void setpath(char *dst, const char *src, const char *ext)
 static void setbasename(char *dst, const char *src, const char *name)
 {
     char *p;
+
     strcpy(dst,src);
     if ((p=strrchr(dst,'\\'))) *(p+1)='\0';
-    else if ((p=strrchr(dst,'/'))) *(p+1)='\0';
+    else if ((p=strrchr(dst,'/')))*(p+1)='\0';
     else dst[0]='\0';
     strcat(dst,name);
 }
 
-static void fprint_center(FILE *fp, int width, const char *text)
+static void printcenter(FILE *fp, int width, const char *text)
 {
     int len,left,right,i;
+
     if (!fp||width<=0) return;
     if (!text) text="";
     len=(int)strlen(text);
@@ -501,6 +365,7 @@ static const char *systxt(int sys)
 static int satfromid(const char *id)
 {
     int sat=satid2no(id);
+
     if (sat>0) return sat;
     return atoi(id);
 }
@@ -516,6 +381,7 @@ static int splitcsv(char *line, char **cols, int maxcols)
 {
     int n=0;
     char *p=line;
+
     while (n<maxcols) {
         cols[n++]=p;
         if (!(p=strchr(p,','))) break;
@@ -528,6 +394,7 @@ static int loadrbiasfile(const char *path)
 {
     FILE *fp=fopen(path,"r");
     char buff[1024],*cols[16];
+
     rbiasp_t *tmp=NULL;
     int n=0,cap=0;
     if (!fp) return 0;
@@ -571,7 +438,7 @@ static int loadrbiasfile(const char *path)
 static int ensurerbias(void)
 {
     const char *paths[]={
-        rbias_path_hint,
+        rbiaspath,
         "result\\Open\\rbias_params.csv",
         "results\\bias_envelope\\output\\rbias_params.csv",
         "result\\bias_envelope\\output\\rbias_params.csv",
@@ -581,16 +448,16 @@ static int ensurerbias(void)
         "..\\..\\result\\Open\\rbias_params.csv",
         "..\\..\\results\\bias_envelope\\output\\rbias_params.csv",
         "..\\..\\result\\bias_envelope\\output\\rbias_params.csv",
-        "bias_envelope\\output\\rbias_params.csv"
-    };
+        "bias_envelope\\output\\rbias_params.csv"};
     int i;
-    if (rbias_loaded) return 1;
-    if (rbias_try) return 0;
-    rbias_try=1;
+
+    if (rbiasload) return 1;
+    if (rbiastry) return 0;
+    rbiastry=1;
     for (i=0;i<(int)(sizeof(paths)/sizeof(paths[0]));i++) {
         if (!paths[i]||!paths[i][0]) continue;
         if (loadrbiasfile(paths[i])) {
-            rbias_loaded=1;
+            rbiasload=1;
             return 1;
         }
     }
@@ -600,14 +467,17 @@ static int ensurerbias(void)
 static int findrbias(int sysi, int band, int meas, int sat)
 {
     int i;
+
     for (i=0;i<nrbiasp;i++) {
         if (rbiasp[i].sysidx==sysi&&rbiasp[i].band==band&&
-            rbiasp[i].meas==meas&&rbiasp[i].sat==sat) return i;
+            rbiasp[i].meas==meas&&rbiasp[i].sat==sat)
+            return i;
     }
     return -1;
 }
 
-static int calcbiasenu(rtk_t *rtk, double *be, double *bn, double *bu, int *rows)
+static int calcbiasenu(rtk_t *rtk, double *be, double *bn, double *bu,
+                       int *rows)
 {
     rtkim_t *mon=&rtk->intg;
     double pos[3],E[9],dxyz[3]={0},denu[3],*mu,*R,*W,*tmp,*dx;
@@ -615,7 +485,9 @@ static int calcbiasenu(rtk_t *rtk, double *be, double *bn, double *bu, int *rows
     int sel[RTKIM_MAX_BIAS_ROWS];
     *be=*bn=*bu=0.0;
     if (rows) *rows=0;
-    if (!ensurerbias()||mon->bnv<=0||mon->bnx!=nx||!mon->bH||!mon->bR) return 0;
+    if (!ensurerbias()||mon->bnv<=0||mon->bnx!=nx||!mon->bH||
+        !mon->bR)
+        return 0;
     for (i=0;i<mon->bnv&&n<RTKIM_MAX_BIAS_ROWS;i++) {
         sf=(mon->bflg[i]>>16)&0xFF;
         su=(mon->bflg[i]>>8)&0xFF;
@@ -630,9 +502,17 @@ static int calcbiasenu(rtk_t *rtk, double *be, double *bn, double *bu, int *rows
         sel[n++]=i;
     }
     if (n<=0) return 0;
-    mu=mat(n,1); R=mat(n,n); W=mat(n,n); tmp=mat(nx,1); dx=mat(nx,1);
+    mu=mat(n,1);
+    R=mat(n,n);
+    W=mat(n,n);
+    tmp=mat(nx,1);
+    dx=mat(nx,1);
     if (!mu||!R||!W||!tmp||!dx) {
-        free(mu); free(R); free(W); free(tmp); free(dx);
+        free(mu);
+        free(R);
+        free(W);
+        free(tmp);
+        free(dx);
         return 0;
     }
     for (i=0;i<n;i++) {
@@ -649,18 +529,25 @@ static int calcbiasenu(rtk_t *rtk, double *be, double *bn, double *bu, int *rows
     }
     matcpy(W,R,n,n);
     if (matinv(W,n)) {
-        free(mu); free(R); free(W); free(tmp); free(dx);
+        free(mu);
+        free(R);
+        free(W);
+        free(tmp);
+        free(dx);
         return 0;
     }
     for (k=0;k<nx;k++) {
         double s=0.0;
-        for (i=0;i<n;i++) for (j=0;j<n;j++) {
-            s+=mon->bH[k+sel[i]*nx]*W[i+j*n]*mu[j];
-        }
+        for (i=0;i<n;i++)
+            for (j=0;j<n;j++) {
+                s+=mon->bH[k+sel[i]*nx]*W[i+j*n]*mu[j];
+            }
         tmp[k]=s;
     }
     matmul("NN",nx,1,nx,1.0,rtk->P,tmp,0.0,dx);
-    dxyz[0]=dx[0]; dxyz[1]=dx[1]; dxyz[2]=dx[2];
+    dxyz[0]=dx[0];
+    dxyz[1]=dx[1];
+    dxyz[2]=dx[2];
     ecef2pos(rtk->sol.rr,pos);
     xyz2enu(pos,E);
     matmul("NN",3,1,3,1.0,E,dxyz,0.0,denu);
@@ -668,7 +555,11 @@ static int calcbiasenu(rtk_t *rtk, double *be, double *bn, double *bu, int *rows
     *bn=fabs(denu[1]);
     *bu=fabs(denu[2]);
     if (rows) *rows=n;
-    free(mu); free(R); free(W); free(tmp); free(dx);
+    free(mu);
+    free(R);
+    free(W);
+    free(tmp);
+    free(dx);
     return 1;
 }
 #endif
@@ -676,13 +567,16 @@ static int calcbiasenu(rtk_t *rtk, double *be, double *bn, double *bu, int *rows
 static int hasobs(const obsd_t *obs, int n, int rcv, int sat)
 {
     int i;
-    for (i=0;i<n;i++) if (obs[i].rcv==rcv&&obs[i].sat==sat) return 1;
+
+    for (i=0;i<n;i++)
+        if (obs[i].rcv==rcv&&obs[i].sat==sat) return 1;
     return 0;
 }
 
 static int commonsat(const obsd_t *obs, int n, int *sat)
 {
     int i,ns=0;
+
     for (i=0;i<n;i++) {
         if (obs[i].rcv!=1) continue;
         if (!hasobs(obs,n,2,obs[i].sat)) continue;
@@ -695,16 +589,18 @@ static int commonsat(const obsd_t *obs, int n, int *sat)
 static void countobs(const obsd_t *obs, int n, int *nu, int *nr)
 {
     int i;
+
     *nu=*nr=0;
     for (i=0;i<n;i++) {
-        if (obs[i].rcv==1) (*nu)++;
-        else if (obs[i].rcv==2) (*nr)++;
+        if (obs[i].rcv==1)(*nu)++;
+        else if (obs[i].rcv==2)(*nr)++;
     }
 }
 
 static int finddef(rtkim_t *mon, int mode, int sat)
 {
     int i;
+
     for (i=0;i<mon->ndef;i++) {
         if (mon->def[i].mode==mode&&mon->def[i].sat==sat) return i;
     }
@@ -715,7 +611,7 @@ static int adddef(rtk_t *rtk, int mode, int sat)
 {
     rtkim_t *mon=&rtk->intg;
     prcopt_t *opt=&rtk->opt;
-    int max=opt->rtk_integrity_max_subset_filters;
+    int max=opt->maxintsub;
     int i=mon->ndef;
     if (max<=0) return -1;
     if (i>=max||i>=MAXSAT+1) return -1;
@@ -730,6 +626,7 @@ static int adddef(rtk_t *rtk, int mode, int sat)
 static int getdef(rtk_t *rtk, int mode, int sat)
 {
     int i=finddef(&rtk->intg,mode,sat);
+
     return i>=0?i:adddef(rtk,mode,sat);
 }
 
@@ -745,17 +642,18 @@ static void initchild(rtk_t *rtk, rtkim_ss_t *ss)
 {
     prcopt_t opt=rtk->opt;
     if (ss->rtk) return;
-    opt.enable_rtk_integrity_monitor=0;
+    opt.intmon=0;
     opt.modear=ARMODE_OFF;
     ss->rtk=(rtk_t *)malloc(sizeof(rtk_t));
     if (!ss->rtk) return;
     rtkinit(ss->rtk,&opt);
-    ss->rtk->int_child=1;
+    ss->rtk->intchild=1;
 }
 
 static void filtobs(const obsd_t *obs, int n, int sat, obsd_t *out, int *m)
 {
     int i;
+
     *m=0;
     for (i=0;i<n;i++) {
         if (sat>0&&obs[i].sat==sat) continue;
@@ -766,6 +664,7 @@ static void filtobs(const obsd_t *obs, int n, int sat, obsd_t *out, int *m)
 static void setsolfromfilter(rtk_t *rtk)
 {
     int i,nx=rtk->nx;
+
     for (i=0;i<3;i++) {
         rtk->sol.rr[i]=rtk->x[i];
         rtk->sol.qr[i]=(float)rtk->P[i+i*nx];
@@ -785,15 +684,18 @@ static void condamb(rtk_t *main, rtkim_def_t *def, rtk_t *child,
     if (main->sol.stat!=SOLQ_FIX||def->mode==RTKIM_F_NFIX) return;
     if (main->na<=0||main->na!=child->na||main->nx!=child->nx) return;
 
-    for (i=1;i<=MAXSAT&&nv<MAXSAT*NFREQ;i++) for (f=0;f<nf;f++) {
-        j=IB_(i,f,&child->opt);
-        if (j<0||j>=nx||j>=main->na) continue;
-        if (def->mode==RTKIM_F_SAT&&i==def->sat) continue;
-        if (main->xa[j]==0.0||child->x[j]==0.0) continue;
-        if (main->Pa[j+j*main->na]<=0.0||child->P[j+j*nx]<=0.0) continue;
-        idx[nv++]=j;
-        if (nv>=MAXSAT*NFREQ) break;
-    }
+    for (i=1;i<=MAXSAT&&nv<MAXSAT*NFREQ;i++)
+        for (f=0;f<nf;f++) {
+            j=IB_(i,f,&child->opt);
+            if (j<0||j>=nx||j>=main->na) continue;
+            if (def->mode==RTKIM_F_SAT&&i==def->sat) continue;
+            if (main->xa[j]==0.0||child->x[j]==0.0) continue;
+            if (main->Pa[j+j*main->na]<=0.0||
+                child->P[j+j*nx]<=0.0)
+                continue;
+            idx[nv++]=j;
+            if (nv>=MAXSAT*NFREQ) break;
+        }
     if (nv<=0) return;
 
     for (i=0;i<nv;i++) {
@@ -801,22 +703,26 @@ static void condamb(rtk_t *main, rtkim_def_t *def, rtk_t *child,
         double *kvec,*prow;
         j=idx[i];
         v=main->xa[j]-child->x[j];
-        r=main->Pa[j+j*main->na]>1E-6?main->Pa[j+j*main->na]:1E-6;
+        r=main->Pa[j+j*main->na]>1E-6?main->Pa[j+j*main->na]
+                                              :1E-6;
         s=child->P[j+j*nx]+r;
         if (s<=0.0) continue;
         kvec=(double *)malloc(sizeof(double)*nx);
         prow=(double *)malloc(sizeof(double)*nx);
         if (!kvec||!prow) {
-            free(kvec); free(prow);
+            free(kvec);
+            free(prow);
             continue;
         }
         for (k=0;k<nx;k++) kvec[k]=child->P[k+j*nx]/s;
         for (l=0;l<nx;l++) prow[l]=child->P[j+l*nx];
         for (k=0;k<nx;k++) child->x[k]+=kvec[k]*v;
-        for (k=0;k<nx;k++) for (l=0;l<nx;l++) {
-            child->P[k+l*nx]-=kvec[k]*prow[l];
-        }
-        free(kvec); free(prow);
+        for (k=0;k<nx;k++)
+            for (l=0;l<nx;l++) {
+                child->P[k+l*nx]-=kvec[k]*prow[l];
+            }
+        free(kvec);
+        free(prow);
         ss->ambc++;
     }
     if (ss->ambc>0) setsolfromfilter(child);
@@ -836,9 +742,12 @@ static void runsub(rtk_t *rtk, int idx, const obsd_t *obs, int n,
     if (!ss->rtk) return;
     ss->init=1;
     ss->rtk->opt=rtk->opt;
-    ss->rtk->opt.enable_rtk_integrity_monitor=0;
+    ss->rtk->opt.intmon=0;
     ss->rtk->opt.modear=ARMODE_OFF;
-    ss->rtk->int_child=1;
+    ss->rtk->intchild=1;
+#if ENABLE_RTK_RANSAC_ARAIM
+    memcpy(ss->rtk->ransacmask,rtk->ransacmask,sizeof(rtk->ransacmask));
+#endif
     filtobs(obs,n,def->mode==RTKIM_F_SAT?def->sat:0,ob,&m);
     ok=rtkpos(ss->rtk,ob,m,nav,sta);
     ss->ready=1;
@@ -847,7 +756,7 @@ static void runsub(rtk_t *rtk, int idx, const obsd_t *obs, int n,
     condamb(rtk,def,ss->rtk,ss);
     for (i=0;i<3;i++) ss->pos[i]=ss->rtk->sol.rr[i];
     for (i=0;i<6;i++) ss->q[i]=ss->rtk->sol.qr[i];
-    sigenu(ss->pos,ss->q,ss->sig);
+    rtkimsigenu(ss->pos,ss->q,ss->sig);
     sepenu(rtk->sol.rr,ss->pos,ss->sep);
     ss->qi=ss->rtk->sol.stat;
     ss->ratio=ss->rtk->sol.ratio;
@@ -861,11 +770,14 @@ static void runsub(rtk_t *rtk, int idx, const obsd_t *obs, int n,
 
 static void calcpl(rtk_t *rtk)
 {
-#if RTK_INT_METHOD==RTK_INT_METHOD_SLOPE
-    calcpl_slope(rtk);
+#if RTK_INT_METHOD==RTK_INT_METHOD_GLS_SS
+    rtkimglsassess(rtk);
+    return;
+#elif RTK_INT_METHOD==RTK_INT_METHOD_SLOPE
+    rtkimslassess(rtk);
     return;
 #elif RTK_INT_METHOD==RTK_INT_METHOD_LS_SS
-    calcpl_ls(rtk);
+    calcplls(rtk);
     return;
 #else
     rtkim_t *mon=&rtk->intg;
@@ -879,15 +791,17 @@ static void calcpl(rtk_t *rtk)
 
     memset(pl,0,sizeof(*pl));
     if (rtk->sol.stat==SOLQ_NONE) {
-        rtk->int_hpl=0.0;
-        rtk->int_vpl=0.0;
+        rtk->inthpl=0.0;
+        rtk->intvpl=0.0;
         return;
     }
     for (i=0;i<6;i++) qmain[i]=rtk->sol.qr[i];
-    integrity_thresholds(&rtk->opt,mon->ndef,&kmain,&ksub,&kss);
-    sigenu(rtk->sol.rr,qmain,msig);
+    rtkimthres(&rtk->opt,mon->ndef,&kmain,&ksub,&kss);
+    rtkimsigenu(rtk->sol.rr,qmain,msig);
     for (i=0;i<3;i++) pl->msig[i]=msig[i];
-    pe=kmain*msig[0]; pn=kmain*msig[1]; pu=kmain*msig[2];
+    pe=kmain*msig[0];
+    pn=kmain*msig[1];
+    pu=kmain*msig[2];
     hpl0=SQRT_(SQR_(pe)+SQR_(pn));
     pl->hsrc=pl->vsrc=0;
     for (i=0;i<mon->ndef;i++) {
@@ -896,7 +810,9 @@ static void calcpl(rtk_t *rtk)
         double sss_e,sss_n,sss_u;
         double sube,subn,subu,hsub;
         if (!ss->act||!ss->valid) continue;
-        ssig[0]=ss->sig[0]; ssig[1]=ss->sig[1]; ssig[2]=ss->sig[2];
+        ssig[0]=ss->sig[0];
+        ssig[1]=ss->sig[1];
+        ssig[2]=ss->sig[2];
         sss_e=SQRT_(SQR_(ssig[0])-SQR_(msig[0]));
         sss_n=SQRT_(SQR_(ssig[1])-SQR_(msig[1]));
         sss_u=SQRT_(SQR_(ssig[2])-SQR_(msig[2]));
@@ -906,35 +822,57 @@ static void calcpl(rtk_t *rtk)
         hsub=SQRT_(SQR_(sube)+SQR_(subn));
         if (hsub>hpl0) {
             hpl0=hsub;
-            pe=sube; pn=subn;
-            pl->hsrc=def->id; pl->hmode=def->mode; pl->hsat=def->sat;
-            pl->hsig[0]=ssig[0]; pl->hsig[1]=ssig[1]; pl->hsig[2]=ssig[2];
-            pl->hsss[0]=sss_e; pl->hsss[1]=sss_n; pl->hsss[2]=0.0;
-            pl->hsep[0]=ss->sep[0]; pl->hsep[1]=ss->sep[1]; pl->hsep[2]=ss->sep[2];
+            pe=sube;
+            pn=subn;
+            pl->hsrc=def->id;
+            pl->hmode=def->mode;
+            pl->hsat=def->sat;
+            pl->hsig[0]=ssig[0];
+            pl->hsig[1]=ssig[1];
+            pl->hsig[2]=ssig[2];
+            pl->hsss[0]=sss_e;
+            pl->hsss[1]=sss_n;
+            pl->hsss[2]=0.0;
+            pl->hsep[0]=ss->sep[0];
+            pl->hsep[1]=ss->sep[1];
+            pl->hsep[2]=ss->sep[2];
         }
         if (subu>pu) {
-            pu=subu; pl->vsrc=def->id; pl->vmode=def->mode; pl->vsat=def->sat;
-            pl->vsig[0]=ssig[0]; pl->vsig[1]=ssig[1]; pl->vsig[2]=ssig[2];
-            pl->vsss[0]=0.0; pl->vsss[1]=0.0; pl->vsss[2]=sss_u;
-            pl->vsep[0]=ss->sep[0]; pl->vsep[1]=ss->sep[1]; pl->vsep[2]=ss->sep[2];
+            pu=subu;
+            pl->vsrc=def->id;
+            pl->vmode=def->mode;
+            pl->vsat=def->sat;
+            pl->vsig[0]=ssig[0];
+            pl->vsig[1]=ssig[1];
+            pl->vsig[2]=ssig[2];
+            pl->vsss[0]=0.0;
+            pl->vsss[1]=0.0;
+            pl->vsss[2]=sss_u;
+            pl->vsep[0]=ss->sep[0];
+            pl->vsep[1]=ss->sep[1];
+            pl->vsep[2]=ss->sep[2];
         }
     }
-    pl->pe=pe; pl->pn=pn; pl->pu=pu;
+    pl->pe=pe;
+    pl->pn=pn;
+    pl->pu=pu;
     pl->hpl0=hpl0;
     pl->vpl0=pu;
 #if ENABLE_RTK_ARAIM_PL_BIAS_TERM
     if (calcbiasenu(rtk,&be,&bn,&bu,&brows)) {
-        pl->bias_loaded=1;
-        pl->bias_rows=brows;
-        pl->be=be; pl->bn=bn; pl->bu=bu;
+        pl->biasload=1;
+        pl->nbias=brows;
+        pl->be=be;
+        pl->bn=bn;
+        pl->bu=bu;
     }
 #endif
     pl->hpl=SQRT_(SQR_(pe+pl->be)+SQR_(pn+pl->bn));
     pl->vpl=pu+pl->bu;
     pl->hadd=pl->hpl-pl->hpl0;
     pl->vadd=pl->vpl-pl->vpl0;
-    rtk->int_hpl=pl->hpl;
-    rtk->int_vpl=pl->vpl;
+    rtk->inthpl=pl->hpl;
+    rtk->intvpl=pl->vpl;
 #endif
 }
 
@@ -947,15 +885,17 @@ static void evalfde(rtk_t *rtk)
     double chi2_thres=0.0;
 #endif
     int i,k;
-    if (!rtk->opt.enable_rtk_integrity_fde_recovery) {
+    if (!rtk->opt.intfde) {
         mon->fde=best;
         return;
     }
 #if ENABLE_RTK_INTEGRITY_CHI2_GATE
     if (rtk->sol.dof>0) {
-        chi2_thres=rtk->sol.dof<=100?chisqr[rtk->sol.dof-1]:chisqr[99];
+        chi2_thres=
+            rtk->sol.dof<=100?chisqr[rtk->sol.dof-1]:chisqr[99];
     }
-    if (rtk->sol.stat==SOLQ_NONE||rtk->sol.dof<=0||rtk->sol.chi2testvalue<=chi2_thres) {
+    if (rtk->sol.stat==SOLQ_NONE||rtk->sol.dof<=0||
+        rtk->sol.chi2testvalue<=chi2_thres) {
         mon->fde=best;
         return;
     }
@@ -965,7 +905,7 @@ static void evalfde(rtk_t *rtk)
         return;
     }
 #endif
-    integrity_thresholds(&rtk->opt,mon->ndef,NULL,NULL,&kss);
+    rtkimthres(&rtk->opt,mon->ndef,NULL,NULL,&kss);
     for (i=0;i<mon->ndef;i++) {
         rtkim_ss_t *ss=mon->ss+i;
         rtkim_def_t *def=mon->def+i;
@@ -980,22 +920,23 @@ static void evalfde(rtk_t *rtk)
         trace(3,
               "fde score: subset=%d mode=%d sat=%d qi=%d ratio=%.3f "
               "sep=%.4f %.4f %.4f score=%.4f\n",
-              def->id,def->mode,def->sat,ss->qi,ss->ratio,
-              ss->sep[0],ss->sep[1],ss->sep[2],score);
+              def->id,def->mode,def->sat,ss->qi,ss->ratio,ss->sep[0],
+              ss->sep[1],ss->sep[2],score);
         if (score>best.score) {
             best.mode=def->mode;
             best.id=def->id;
             best.sat=def->sat;
             best.score=score;
-            best.act=def->mode==RTKIM_F_SAT?RTKIM_A_SAT:
-                     def->mode==RTKIM_F_NFIX?RTKIM_A_FLOAT:RTKIM_A_NONE;
+            best.act=def->mode==RTKIM_F_SAT?RTKIM_A_SAT
+                       :def->mode==RTKIM_F_NFIX?RTKIM_A_FLOAT
+                                                   :RTKIM_A_NONE;
         }
     }
     if (best.score<=1.0) memset(&best,0,sizeof(best));
     mon->fde=best;
     mon->act=best;
-    rtk->int_fde_mode=best.mode;
-    rtk->int_fde_sat=best.sat;
+    rtk->intfdemode=best.mode;
+    rtk->intfdesat=best.sat;
     trace(3,"fde best : subset=%d mode=%d sat=%d score=%.4f act=%d\n",
           best.id,best.mode,best.sat,best.score,best.act);
 }
@@ -1004,73 +945,110 @@ static void subout(const rtk_t *rtk)
 {
     const rtkim_t *mon=&rtk->intg;
     int i;
-    if (!fp_sub||!rtk->opt.enable_rtk_integrity_subset_debug_output) return;
+    if (!fp_sub||!rtk->opt.intoutsub) return;
     for (i=0;i<mon->ndef;i++) {
         const rtkim_def_t *def=mon->def+i;
         const rtkim_ss_t *ss=mon->ss+i;
         if (!ss->act) continue;
-        if (rtk->opt.rtk_integrity_debug_subset_id>0&&
-            rtk->opt.rtk_integrity_debug_subset_id!=def->id) continue;
-        if (rtk->opt.rtk_integrity_debug_satellite>0&&
-            rtk->opt.rtk_integrity_debug_satellite!=def->sat) continue;
-        fprintf(fp_sub,"%-23s %6d %6d %6d %6d %8d %12.4f %12.4f %12.4f %10.4f %10.4f %10.4f\n",
-            time_str(mon->ep.time,3),def->id,def->mode,def->sat,ss->valid,
-            ss->ambc,ss->pos[0],ss->pos[1],ss->pos[2],ss->sep[0],ss->sep[1],
-            ss->sep[2]);
+        if (rtk->opt.intdbgid>0&&rtk->opt.intdbgid!=def->id) continue;
+        if (rtk->opt.intdbgsat>0&&rtk->opt.intdbgsat!=def->sat) continue;
+        fprintf(fp_sub,
+                "%-23s %6d %6d %6d %6d %8d %12.4f %12.4f %12.4f %10.4f %10.4f "
+                "%10.4f\n",
+                time_str(mon->ep.time,3),def->id,def->mode,def->sat,
+                ss->valid,ss->ambc,ss->pos[0],ss->pos[1],ss->pos[2],
+                ss->sep[0],ss->sep[1],ss->sep[2]);
     }
 }
 
-static double phase_rms(const rtk_t *rtk, int *count)
+static double phaserms(const rtk_t *rtk, int *count)
 {
     double s=0.0;
     int i,f,n=0,nf=NF_(&rtk->opt);
-    for (i=0;i<MAXSAT;i++) for (f=0;f<nf&&f<NFREQ;f++) {
-        double r=rtk->ssat[i].resc[f];
-        if (!rtk->ssat[i].vsat[f]||r==0.0) continue;
-        s+=r*r;
-        n++;
-    }
+
+    for (i=0;i<MAXSAT;i++)
+        for (f=0;f<nf&&f<NFREQ;f++) {
+            double r=rtk->ssat[i].resc[f];
+            if (!rtk->ssat[i].vsat[f]||r==0.0) continue;
+            s+=r*r;
+            n++;
+        }
     if (count) *count=n;
     return n>0?sqrt(s/n):0.0;
 }
 
-EXPORT void rtkim_init(rtk_t *rtk, const prcopt_t *opt)
+/* initialize RTK integrity monitor -------------------------------------------
+* args   : rtk_t    *rtk   IO  RTK control and monitor state
+*          prcopt_t *opt   I   processing options
+* return : none
+* notes  : Called from rtkinit(); release an existing monitor before reuse.
+*-----------------------------------------------------------------------------*/
+EXPORT void rtkiminit(rtk_t *rtk, const prcopt_t *opt)
 {
     memset(&rtk->intg,0,sizeof(rtk->intg));
-    rtk->intg.ena=opt->enable_rtk_integrity_monitor;
-    rtk->int_reproc=0;
-    rtk->int_fde_mode=0;
-    rtk->int_fde_sat=0;
-    rtk->int_fde_pre_mode=0;
-    rtk->int_fde_pre_sat=0;
-    rtk->int_fde_action=0;
-    rtk->int_hpl=rtk->int_vpl=0.0;
+    rtk->intg.ena=opt->intmon;
+    rtk->intreproc=0;
+    rtk->intfdemode=0;
+    rtk->intfdesat=0;
+    rtk->intfdemode0=0;
+    rtk->intfdesat0=0;
+    rtk->intfdeact=0;
+    rtk->inthpl=rtk->intvpl=0.0;
 }
 
-EXPORT void rtkim_free(rtk_t *rtk)
+/* free RTK integrity monitor -------------------------------------------------
+* args   : rtk_t *rtk      IO  RTK control and monitor state
+* return : none
+* notes  : Release subset filters and model buffers; clear monitor state.
+*-----------------------------------------------------------------------------*/
+EXPORT void rtkimfree(rtk_t *rtk)
 {
     int i;
+
     for (i=0;i<rtk->intg.ndef;i++) freechild(rtk->intg.ss+i);
-    free(rtk->intg.bH); rtk->intg.bH=NULL;
-    free(rtk->intg.bR); rtk->intg.bR=NULL;
-    free(rtk->intg.bv); rtk->intg.bv=NULL;
+    free(rtk->intg.bH);
+    rtk->intg.bH=NULL;
+    free(rtk->intg.bR);
+    rtk->intg.bR=NULL;
+    free(rtk->intg.bv);
+    rtk->intg.bv=NULL;
+    free(rtk->intg.slK);
+    rtk->intg.slK=NULL;
+    free(rtk->intg.slQi);
+    rtk->intg.slQi=NULL;
+    free(rtk->intg.glsQ);
+    rtk->intg.glsQ=NULL;
+    free(rtk->intg.glsF);
+    rtk->intg.glsF=NULL;
     memset(&rtk->intg,0,sizeof(rtk->intg));
 }
 
-EXPORT void rtkim_saveddr(rtk_t *rtk, const double *H, const double *R,
-                           const double *v, const int *vflg, int nx, int nv)
+/* save current DD observation model ------------------------------------------
+* args   : rtk_t  *rtk     IO  RTK control and monitor state
+*          double *H       I   design matrix (nx x nv, column-major)
+*          double *R       I   observation covariance (nv x nv, m^2)
+*          double *v       I   residuals (nv x 1, m)
+*          int    *vflg    I   DD row flags (nv x 1)
+*          int    nx,nv    I   state and observation dimensions
+* return : none
+* notes  : Captures the supplied model for subsequent integrity assessment.
+*-----------------------------------------------------------------------------*/
+EXPORT void rtkimsaveddr(rtk_t *rtk, const double *H, const double *R,
+                         const double *v, const int *vflg, int nx, int nv)
 {
     rtkim_t *mon=&rtk->intg;
     int i,n=nv;
-    if (!rtk->opt.enable_rtk_integrity_monitor||rtk->int_child) return;
+    if (!rtk->opt.intmon||rtk->intchild) return;
     if (!H||!R||!v||!vflg||nx<=0||nv<=0) return;
     if (n>RTKIM_MAX_BIAS_ROWS) n=RTKIM_MAX_BIAS_ROWS;
     if (mon->bnx!=nx||!mon->bH) {
         free(mon->bH);
         mon->bH=(double *)malloc(sizeof(double)*nx*RTKIM_MAX_BIAS_ROWS);
     }
-    if (!mon->bR) mon->bR=(double *)malloc(sizeof(double)*RTKIM_MAX_BIAS_ROWS*RTKIM_MAX_BIAS_ROWS);
-    if (!mon->bv) mon->bv=(double *)malloc(sizeof(double)*RTKIM_MAX_BIAS_ROWS);
+    if (!mon->bR)
+        mon->bR=(double *)malloc(sizeof(double)*RTKIM_MAX_BIAS_ROWS*
+                                   RTKIM_MAX_BIAS_ROWS);
+    if (!mon->bv) mon->bv=(double *)malloc(sizeof(double) *RTKIM_MAX_BIAS_ROWS);
     if (!mon->bH||!mon->bR||!mon->bv) return;
     mon->bnx=nx;
     mon->bnv=n;
@@ -1086,12 +1064,12 @@ EXPORT void rtkim_saveddr(rtk_t *rtk, const double *H, const double *R,
     }
 }
 
-EXPORT void rtkim_export_rbias(const rtk_t *rtk, const double *v,
-                                const int *vflg, int nv)
+EXPORT void rtkimoutbias(const rtk_t *rtk, const double *v, const int *vflg,
+                         int nv)
 {
     double tow;
     int week,i,qi;
-    if (!fp_rbias||!out_rbias||!rtk->opt.enable_rtk_integrity_rbias_export) return;
+    if (!fp_rbias||!outbias||!rtk->opt.intoutbias) return;
     if (!v||!vflg||nv<=0) return;
     tow=time2gpst(rtk->sol.time,&week);
     qi=rtk->sol.stat>=SOLQ_FIX?rtk->sol.stat:SOLQ_FIX;
@@ -1105,23 +1083,33 @@ EXPORT void rtkim_export_rbias(const rtk_t *rtk, const double *v,
         if (sf<=0||su<=0||si<0) continue;
         satno2id(su,idu);
         satno2id(sf,idf);
-        fprintf(fp_rbias,"$RBIAS,%s,%.3f,%d,%d,%.3f,%d,%s,%d,%s,%s,%s,%.6f,%.6f\n",
-            time_str(rtk->sol.time,3),tow,rtk->sol.ns,qi,
-            rtk->sol.ratio,si,systxt(sys),frq,meas?"CODE":"PHASE",
-            idu,idf,v[i],fabs(v[i]));
+        fprintf(fp_rbias,
+                "$RBIAS,%s,%.3f,%d,%d,%.3f,%d,%s,%d,%s,%s,%s,%.6f,%.6f\n",
+                time_str(rtk->sol.time,3),tow,rtk->sol.ns,qi,
+                rtk->sol.ratio,si,systxt(sys),frq,meas?"CODE":"PHASE",
+                idu,idf,v[i],fabs(v[i]));
     }
 }
 
-EXPORT void rtkim_detect(rtk_t *rtk, const obsd_t *obs, int nobs,
-                         const nav_t *nav, const sta_t *sta)
+/* prepare fault modes and detect faults --------------------------------------
+* args   : rtk_t  *rtk     IO  RTK control and monitor state
+*          obsd_t *obs     I   rover and base observations
+*          int    nobs     I   number of observations
+*          nav_t  *nav     I   navigation data
+*          sta_t  *sta     I   station data
+* return : none
+* notes  : Called after positioning; method selection controls subset/FDE use.
+*-----------------------------------------------------------------------------*/
+EXPORT void rtkimdetect(rtk_t *rtk, const obsd_t *obs, int nobs,
+                        const nav_t *nav, const sta_t *sta)
 {
     rtkim_t *mon=&rtk->intg;
     int sat[MAXSAT],ns,i,nu,nr;
-    if (!rtk->opt.enable_rtk_integrity_monitor||rtk->int_child) return;
-    if (rtk->int_reproc<=0) {
-        rtk->int_fde_pre_mode=0;
-        rtk->int_fde_pre_sat=0;
-        rtk->int_fde_action=0;
+    if (!rtk->opt.intmon||rtk->intchild) return;
+    if (rtk->intreproc<=0) {
+        rtk->intfdemode0=0;
+        rtk->intfdesat0=0;
+        rtk->intfdeact=0;
     }
     mon->ena=mon->init=1;
     for (i=0;i<mon->ndef;i++) mon->ss[i].act=0;
@@ -1134,79 +1122,105 @@ EXPORT void rtkim_detect(rtk_t *rtk, const obsd_t *obs, int nobs,
     mon->ep.qi=rtk->sol.stat;
     mon->ep.ratio=rtk->sol.ratio;
     mon->ep.fixed=rtk->sol.stat==SOLQ_FIX;
-    mon->ep.fixed_upd=mon->ep.fixed;
-#if RTK_INT_METHOD==RTK_INT_METHOD_SLOPE
+    mon->ep.fixupd=mon->ep.fixed;
+#if RTK_INT_METHOD==RTK_INT_METHOD_SLOPE||RTK_INT_METHOD==RTK_INT_METHOD_GLS_SS
     /* The slope method supplies PL only; it must not alter AR/FDE state. */
     mon->ndef=0;
     mon->nact=0;
     memset(&mon->fde,0,sizeof(mon->fde));
     memset(&mon->act,0,sizeof(mon->act));
-    rtk->int_fde_mode=0;
-    rtk->int_fde_sat=0;
+    rtk->intfdemode=0;
+    rtk->intfdesat=0;
     return;
 #elif RTK_INT_METHOD==RTK_INT_METHOD_LS_SS
-    if (rtk->opt.enable_monitor_single_satellite_fault) {
+    if (rtk->opt.intsat) {
         for (i=0;i<ns;i++) getdef(rtk,RTKIM_F_SAT,sat[i]);
     }
-    if (build_ls_subsets(rtk,mon->pl.msig,NULL)) {
+    if (lssubsets(rtk,mon->pl.msig,NULL)) {
         evalfde(rtk);
-    }
-    else {
+    } else {
         mon->nact=0;
         memset(&mon->fde,0,sizeof(mon->fde));
     }
     return;
 #endif
-    if (rtk->opt.enable_monitor_single_satellite_fault) {
+    if (rtk->opt.intsat) {
         for (i=0;i<ns;i++) getdef(rtk,RTKIM_F_SAT,sat[i]);
     }
-    if (mon->ep.fixed&&rtk->opt.enable_monitor_fixed_ambiguity_update_fault) {
+    if (mon->ep.fixed&&rtk->opt.intamb) {
         getdef(rtk,RTKIM_F_NFIX,0);
     }
     for (i=0;i<mon->ndef;i++) {
-        if (mon->def[i].mode==RTKIM_F_SAT&&!hasobs(obs,nobs,1,mon->def[i].sat)) continue;
+        if (mon->def[i].mode==RTKIM_F_SAT&&
+            !hasobs(obs,nobs,1,mon->def[i].sat))
+            continue;
         if (mon->def[i].mode==RTKIM_F_NFIX&&!mon->ep.fixed) continue;
         runsub(rtk,i,obs,nobs,nav,sta);
     }
     mon->nact=0;
-    for (i=0;i<mon->ndef;i++) if (mon->ss[i].act) mon->nact++;
+    for (i=0;i<mon->ndef;i++)
+        if (mon->ss[i].act) mon->nact++;
     evalfde(rtk);
 }
 
-EXPORT void rtkim_assess(rtk_t *rtk)
+/* assess protection levels ---------------------------------------------------
+* args   : rtk_t *rtk      IO  RTK control and monitor state
+* return : none
+* notes  : Requires initialized epoch data from rtkimdetect().
+*-----------------------------------------------------------------------------*/
+EXPORT void rtkimassess(rtk_t *rtk)
 {
-    if (!rtk->opt.enable_rtk_integrity_monitor||rtk->int_child) return;
+    if (!rtk->opt.intmon||rtk->intchild) return;
     if (!rtk->intg.init) return;
     calcpl(rtk);
 }
 
-EXPORT int rtkim_open(const char *outfile, const prcopt_t *opt)
+EXPORT int rtkimopen(const char *outfile, const prcopt_t *opt)
 {
     char path[1024];
-    if ((!opt->enable_rtk_integrity_monitor&&!opt->enable_rtk_integrity_rbias_export
-#if !ENABLE_RTK_DEBUG_OUTPUT
-        )
+
+    if ((!opt->intmon&&!opt->intoutbias
+#if!ENABLE_RTK_DEBUG_OUTPUT
+         )
 #else
-        &&1)
+         &&1)
 #endif
-        ||!outfile||!*outfile) return 0;
-    setbasename(rbias_path_hint,outfile,"rbias_params.csv");
-    if (opt->enable_rtk_integrity_monitor) {
+        ||!outfile||!*outfile)
+        return 0;
+    setbasename(rbiaspath,outfile,"rbias_params.csv");
+    if (opt->intmon) {
         setpath(path,outfile,".pint");
         fp_pint=fopen(path,"w");
         setpath(path,outfile,".pldiag");
         fp_pld=fopen(path,"w");
-        out_sub=opt->enable_rtk_integrity_subset_debug_output;
-        if (out_sub) {
+#if RTK_INT_METHOD==RTK_INT_METHOD_GLS_SS
+        setpath(path,outfile,".glsdiag");
+        fp_gls=fopen(path,"w");
+        if (fp_gls)
+            fputs("% time nv expected valid missing alert fixed float_match_m "
+                  "subset_seconds HPL VPL Hmode Hsat1 Hsat2 Vmode Vsat1 Vsat2 "
+                  "geometry_failed solve_failed covariance_failed obs_alert "
+                  "fixed_alert obs_ratio fixed_ratio candidate_HPL "
+                  "candidate_VPL\n",
+                  fp_gls);
+        if (opt->intoutsub) {
+            setpath(path,outfile,".glsmodes");
+            fp_glsmode=fopen(path,"w");
+            if (fp_glsmode)
+                fputs("% time mode sat1 sat2 sepE sepN sepU sigE sigN sigU\n",
+                      fp_glsmode);
+        }
+#endif
+        outsub=opt->intoutsub;
+        if (outsub) {
             setpath(path,outfile,".subdiag");
             fp_sub=fopen(path,"w");
         }
+    } else {
+        outsub=0;
     }
-    else {
-        out_sub=0;
-    }
-    out_rbias=opt->enable_rtk_integrity_rbias_export;
-    if (out_rbias) {
+    outbias=opt->intoutbias;
+    if (outbias) {
         setpath(path,outfile,".rbias");
         fp_rbias=fopen(path,"w");
     }
@@ -1214,542 +1228,257 @@ EXPORT int rtkim_open(const char *outfile, const prcopt_t *opt)
         fputs("% ",fp_pint);
         /* "% " is a two-character comment prefix, so use 21 to match the
          * 23-character timestamp field in the data rows. */
-        fprint_center(fp_pint,21,"time"); fputc(' ',fp_pint);
-        fprint_center(fp_pint,12,"x"); fputc(' ',fp_pint);
-        fprint_center(fp_pint,12,"y"); fputc(' ',fp_pint);
-        fprint_center(fp_pint,12,"z"); fputc(' ',fp_pint);
-        fprint_center(fp_pint,4,"nsat"); fputc(' ',fp_pint);
-        fprint_center(fp_pint,2,"QI"); fputc(' ',fp_pint);
-        fprint_center(fp_pint,7,"ratio"); fputc(' ',fp_pint);
-        fprint_center(fp_pint,9,"chi2"); fputc(' ',fp_pint);
-        fprint_center(fp_pint,6,"subT"); fputc(' ',fp_pint);
-        fprint_center(fp_pint,6,"subA"); fputc(' ',fp_pint);
-        fprint_center(fp_pint,8,"HPL"); fputc(' ',fp_pint);
-        fprint_center(fp_pint,8,"VPL"); fputc(' ',fp_pint);
-        fprint_center(fp_pint,7,"FDEmode"); fputc(' ',fp_pint);
-        fprint_center(fp_pint,6,"FDEsat"); fputc(' ',fp_pint);
-        fprint_center(fp_pint,13,"phase_res_rms"); fputc(' ',fp_pint);
-        fprint_center(fp_pint,6,"nPhase"); fputc(' ',fp_pint);
-        fprint_center(fp_pint,10,"FDEpreMode"); fputc(' ',fp_pint);
-        fprint_center(fp_pint,9,"FDEpreSat"); fputc(' ',fp_pint);
-        fprint_center(fp_pint,9,"FDEact"); fputc('\n',fp_pint);
+        printcenter(fp_pint,21,"time");
+        fputc(' ',fp_pint);
+        printcenter(fp_pint,12,"x");
+        fputc(' ',fp_pint);
+        printcenter(fp_pint,12,"y");
+        fputc(' ',fp_pint);
+        printcenter(fp_pint,12,"z");
+        fputc(' ',fp_pint);
+        printcenter(fp_pint,4,"nsat");
+        fputc(' ',fp_pint);
+        printcenter(fp_pint,2,"QI");
+        fputc(' ',fp_pint);
+        printcenter(fp_pint,7,"ratio");
+        fputc(' ',fp_pint);
+        printcenter(fp_pint,9,"chi2");
+        fputc(' ',fp_pint);
+        printcenter(fp_pint,6,"subT");
+        fputc(' ',fp_pint);
+        printcenter(fp_pint,6,"subA");
+        fputc(' ',fp_pint);
+        printcenter(fp_pint,8,"HPL");
+        fputc(' ',fp_pint);
+        printcenter(fp_pint,8,"VPL");
+        fputc(' ',fp_pint);
+        printcenter(fp_pint,7,"FDEmode");
+        fputc(' ',fp_pint);
+        printcenter(fp_pint,6,"FDEsat");
+        fputc(' ',fp_pint);
+        printcenter(fp_pint,13,"phase_res_rms");
+        fputc(' ',fp_pint);
+        printcenter(fp_pint,6,"nPhase");
+        fputc(' ',fp_pint);
+        printcenter(fp_pint,10,"FDEpreMode");
+        fputc(' ',fp_pint);
+        printcenter(fp_pint,9,"FDEpreSat");
+        fputc(' ',fp_pint);
+        printcenter(fp_pint,9,"FDEact");
+        fputc('\n',fp_pint);
     }
     if (fp_pld) {
         fputs("% ",fp_pld);
-        fprint_center(fp_pld,23,"time"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,4,"nsat"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,2,"QI"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,7,"ratio"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,6,"subT"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,6,"subA"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,8,"HPL"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,8,"VPL"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,8,"bias_e"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,8,"bias_n"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,8,"bias_u"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,8,"HPL0"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,8,"VPL0"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,8,"HADD"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,8,"VADD"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,5,"bLd"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,5,"bRow"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,4,"Hsrc"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,5,"Hmode"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,4,"Hsat"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,8,"MsigE"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,8,"MsigN"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,8,"MsigU"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,8,"HsigE"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,8,"HsigN"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,8,"HsigU"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,8,"HsssE"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,8,"HsssN"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,8,"HsssU"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,8,"HsepE"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,8,"HsepN"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,8,"HsepU"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,4,"Vsrc"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,5,"Vmode"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,4,"Vsat"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,8,"VsigE"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,8,"VsigN"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,8,"VsigU"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,8,"VsssE"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,8,"VsssN"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,8,"VsssU"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,8,"VsepE"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,8,"VsepN"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,8,"VsepU"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,10,"FDEpreMode"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,9,"FDEpreSat"); fputc(' ',fp_pld);
-        fprint_center(fp_pld,9,"FDEact"); fputc('\n',fp_pld);
+        printcenter(fp_pld,23,"time");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,4,"nsat");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,2,"QI");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,7,"ratio");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,6,"subT");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,6,"subA");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,8,"HPL");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,8,"VPL");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,8,"bias_e");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,8,"bias_n");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,8,"bias_u");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,8,"HPL0");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,8,"VPL0");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,8,"HADD");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,8,"VADD");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,5,"bLd");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,5,"bRow");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,4,"Hsrc");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,5,"Hmode");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,4,"Hsat");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,8,"MsigE");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,8,"MsigN");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,8,"MsigU");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,8,"HsigE");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,8,"HsigN");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,8,"HsigU");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,8,"HsssE");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,8,"HsssN");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,8,"HsssU");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,8,"HsepE");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,8,"HsepN");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,8,"HsepU");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,4,"Vsrc");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,5,"Vmode");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,4,"Vsat");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,8,"VsigE");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,8,"VsigN");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,8,"VsigU");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,8,"VsssE");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,8,"VsssN");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,8,"VsssU");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,8,"VsepE");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,8,"VsepN");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,8,"VsepU");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,10,"FDEpreMode");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,9,"FDEpreSat");
+        fputc(' ',fp_pld);
+        printcenter(fp_pld,9,"FDEact");
+        fputc('\n',fp_pld);
     }
     if (fp_sub) {
         fputs("% ",fp_sub);
-        fprint_center(fp_sub,23,"time"); fputc(' ',fp_sub);
-        fprint_center(fp_sub,6,"subset"); fputc(' ',fp_sub);
-        fprint_center(fp_sub,6,"mode"); fputc(' ',fp_sub);
-        fprint_center(fp_sub,6,"sat"); fputc(' ',fp_sub);
-        fprint_center(fp_sub,6,"valid"); fputc(' ',fp_sub);
-        fprint_center(fp_sub,8,"amb_cond"); fputc(' ',fp_sub);
-        fprint_center(fp_sub,12,"x"); fputc(' ',fp_sub);
-        fprint_center(fp_sub,12,"y"); fputc(' ',fp_sub);
-        fprint_center(fp_sub,12,"z"); fputc(' ',fp_sub);
-        fprint_center(fp_sub,10,"sep_e"); fputc(' ',fp_sub);
-        fprint_center(fp_sub,10,"sep_n"); fputc(' ',fp_sub);
-        fprint_center(fp_sub,10,"sep_u"); fputc('\n',fp_sub);
+        printcenter(fp_sub,23,"time");
+        fputc(' ',fp_sub);
+        printcenter(fp_sub,6,"subset");
+        fputc(' ',fp_sub);
+        printcenter(fp_sub,6,"mode");
+        fputc(' ',fp_sub);
+        printcenter(fp_sub,6,"sat");
+        fputc(' ',fp_sub);
+        printcenter(fp_sub,6,"valid");
+        fputc(' ',fp_sub);
+        printcenter(fp_sub,8,"amb_cond");
+        fputc(' ',fp_sub);
+        printcenter(fp_sub,12,"x");
+        fputc(' ',fp_sub);
+        printcenter(fp_sub,12,"y");
+        fputc(' ',fp_sub);
+        printcenter(fp_sub,12,"z");
+        fputc(' ',fp_sub);
+        printcenter(fp_sub,10,"sep_e");
+        fputc(' ',fp_sub);
+        printcenter(fp_sub,10,"sep_n");
+        fputc(' ',fp_sub);
+        printcenter(fp_sub,10,"sep_u");
+        fputc('\n',fp_sub);
     }
-    if (fp_rbias) fprintf(fp_rbias,"%% $RBIAS,time,tow_s,nsat,qi,ratio,sysidx,sys,band,meas,sat_u,sat_f,resid_m,absres_m\n");
+    if (fp_rbias)
+        fprintf(fp_rbias,"%% "
+                          "$RBIAS,time,tow_s,nsat,qi,ratio,sysidx,sys,band,"
+                          "meas,sat_u,sat_f,resid_m,absres_m\n");
     return fp_pint||fp_pld||fp_rbias
 #if ENABLE_RTK_DEBUG_OUTPUT
-        ||0
+           ||0
 #endif
         ;
 }
 
-EXPORT void rtkim_close(void)
+EXPORT void rtkimclose(void)
 {
-    if (fp_pint) fclose(fp_pint); fp_pint=NULL;
-    if (fp_pld) fclose(fp_pld); fp_pld=NULL;
-    if (fp_sub) fclose(fp_sub); fp_sub=NULL;
-    if (fp_rbias) fclose(fp_rbias); fp_rbias=NULL;
-    rbias_path_hint[0]='\0';
+    if (fp_pint) fclose(fp_pint);
+    fp_pint=NULL;
+    if (fp_pld) fclose(fp_pld);
+    fp_pld=NULL;
+    if (fp_sub) fclose(fp_sub);
+    fp_sub=NULL;
+    if (fp_gls) fclose(fp_gls);
+    fp_gls=NULL;
+    if (fp_glsmode) fclose(fp_glsmode);
+    fp_glsmode=NULL;
+    if (fp_rbias) fclose(fp_rbias);
+    fp_rbias=NULL;
+    rbiaspath[0]='\0';
 }
 
-EXPORT int rtk_debug_open(const char *outfile)
+EXPORT void rtkimglsout(gtime_t time, int mode, int sat1, int sat2,
+                        const double *sep, const double *sigma)
 {
-#if ENABLE_RTK_DEBUG_OUTPUT
-    char path[1024];
-    if (!outfile||!*outfile) return 0;
-    setpath(path,outfile,".rtk_debug");
-    fp_rtk_dbg=fopen(path,"w");
-    if (fp_rtk_dbg) {
-        fprintf(fp_rtk_dbg,
-            "%% type time stage action sat kept_obs total_obs stat ns ratio chi2 nx na rr0 rr1 rr2 drr0 drr1 drr2\n");
-        fprintf(fp_rtk_dbg,
-            "%% RAWCOUNTS time stage n nu nr\n");
-        fprintf(fp_rtk_dbg,
-            "%% RAWSATSET time stage count sat_list\n");
-        fprintf(fp_rtk_dbg,
-            "%% RAWLINE time stage satid preset_sat decoded_sat ok\n");
-        fprintf(fp_rtk_dbg,
-            "%% SATSET time stage count sat_list\n");
-        fprintf(fp_rtk_dbg,
-            "%% AMB_FIX time ratio threshold dd_index dd_count ref_sat sat freq float_dd_cycles integer_dd_cycles residual_cycles\n");
-        fprintf(fp_rtk_dbg,
-            "%% AMB_TRUTH time ref_sat sat freq truth_constrained_dd_cycles\n");
-        fprintf(fp_rtk_dbg,
-            "%% AMB_FLOAT id time nb index float_dd_cycles\n");
-        fprintf(fp_rtk_dbg,
-            "%% AMB_COV id time nb row col q_cycles2\n");
-        fprintf(fp_rtk_dbg,
-            "%% MC_EPOCH id time nb samples ratio_threshold\n");
-        fprintf(fp_rtk_dbg,
-            "%% MC_MODE id time nb k1 ... kn count probability dx dy dz norm\n");
-        fprintf(fp_rtk_dbg,
-            "%% MC_RESULT id time nb samples accepted correct wrong acceptance_rate conditional_correct_rate\n");
-    }
-    setpath(path,outfile,".vtest");
-    fp_vtest_dbg=fopen(path,"w");
-    if (fp_vtest_dbg) {
-        fprintf(fp_vtest_dbg,
-            "%% VAL time stage solstat ratio nv np dof chi2 threshold pass\n");
-        fprintf(fp_vtest_dbg,
-            "%% TOP time stage rank sat_ref sat_sat meas freq resid sigma contrib\n");
-    }
-    return fp_rtk_dbg!=NULL||fp_vtest_dbg!=NULL;
-#else
-    (void)outfile;
-    return 0;
-#endif
+    if (fp_glsmode)
+        fprintf(fp_glsmode,
+                "%s %d %d %d %.17g %.17g %.17g %.17g %.17g %.17g\n",
+                time_str(time,3),mode,sat1,sat2,sep[0],sep[1],sep[2],
+                sigma[0],sigma[1],sigma[2]);
 }
 
-EXPORT void rtk_debug_close(void)
-{
-#if ENABLE_RTK_DEBUG_OUTPUT
-    if (fp_rtk_dbg) fclose(fp_rtk_dbg); fp_rtk_dbg=NULL;
-    if (fp_vtest_dbg) fclose(fp_vtest_dbg); fp_vtest_dbg=NULL;
-#endif
-}
-
-EXPORT void rtk_debug_valtest(gtime_t time, const char *stage, int solstat,
-                              float ratio, int nv, int np, int dof,
-                              double chi2, double chi2_thres, int pass,
-                              const double *v, const double *R,
-                              const int *vflg, int topn)
-{
-#if ENABLE_RTK_DEBUG_OUTPUT
-    int i,j,k,n,imax[8]={0},used[8]={0};
-    double c[8]={0},sigma;
-    const char *stype;
-    int sat1,sat2,type,freq;
-    if (!fp_vtest_dbg||!stage) return;
-    fprintf(fp_vtest_dbg,
-        "VAL %s %s %d %.3f %d %d %d %.4f %.4f %d\n",
-        time_str(time,3),stage,solstat,ratio,nv,np,dof,chi2,chi2_thres,pass);
-    if (!v||!R||!vflg||nv<=0) {
-        fflush(fp_vtest_dbg);
-        return;
-    }
-    n=topn<0?0:topn;
-    if (n>8) n=8;
-    for (i=0;i<n;i++) {
-        double best=-1.0;
-        int bestj=-1;
-        for (j=0;j<nv;j++) {
-            int skip=0;
-            double rii=R[j+j*nv];
-            if (rii<=0.0) continue;
-            for (k=0;k<i;k++) {
-                if (used[k]==j) {
-                    skip=1;
-                    break;
-                }
-            }
-            if (skip) continue;
-            c[j%8]=v[j]*v[j]/rii;
-            if (c[j%8]>best) {
-                best=c[j%8];
-                bestj=j;
-            }
-        }
-        if (bestj<0) break;
-        used[i]=bestj;
-        imax[i]=bestj;
-        sat1=(vflg[bestj]>>16)&0xFF;
-        sat2=(vflg[bestj]>>8)&0xFF;
-        type=(vflg[bestj]>>4)&0xF;
-        freq=(vflg[bestj]&0xF)+1;
-        stype=type==0?"L":(type==1?"P":"C");
-        sigma=R[bestj+bestj*nv]>0.0?sqrt(R[bestj+bestj*nv]):0.0;
-        fprintf(fp_vtest_dbg,
-            "TOP %s %s %d %d %d %s %d %.4f %.4f %.4f\n",
-            time_str(time,3),stage,i+1,sat1,sat2,stype,freq,
-            v[bestj],sigma,v[bestj]*v[bestj]/R[bestj+bestj*nv]);
-    }
-    fflush(fp_vtest_dbg);
-#else
-    (void)time; (void)stage; (void)solstat; (void)ratio; (void)nv; (void)np;
-    (void)dof; (void)chi2; (void)chi2_thres; (void)pass; (void)v; (void)R;
-    (void)vflg; (void)topn;
-#endif
-}
-
-EXPORT void rtk_debug_epoch(const rtk_t *rtk, const char *stage,
-                            int action, int sat, int kept_obs, int total_obs,
-                            int stat_before, int ns_before, float ratio_before,
-                            double ftest_before, const double *rr_before)
-{
-#if ENABLE_RTK_DEBUG_OUTPUT
-    const sol_t *sol;
-    double d0=0.0,d1=0.0,d2=0.0;
-    if (!fp_rtk_dbg||!rtk||!stage) return;
-    sol=&rtk->sol;
-    if (rr_before) {
-        d0=sol->rr[0]-rr_before[0];
-        d1=sol->rr[1]-rr_before[1];
-        d2=sol->rr[2]-rr_before[2];
-    }
-    fprintf(fp_rtk_dbg,
-        "EPOCH %s %s %d %d %d %d %d %d %.3f %.4f %d %d %.4f %.4f %.4f %.4f %.4f %.4f\n",
-        time_str(sol->time,3),stage,action,sat,kept_obs,total_obs,
-        !strcmp(stage,"before")?stat_before:sol->stat,
-        !strcmp(stage,"before")?ns_before:sol->ns,
-        !strcmp(stage,"before")?ratio_before:sol->ratio,
-        !strcmp(stage,"before")?ftest_before:sol->chi2testvalue,
-        rtk->nx,rtk->na,sol->rr[0],sol->rr[1],sol->rr[2],d0,d1,d2);
-    fflush(fp_rtk_dbg);
-#else
-    (void)rtk; (void)stage; (void)action; (void)sat; (void)kept_obs; (void)total_obs;
-    (void)stat_before; (void)ns_before; (void)ratio_before; (void)ftest_before; (void)rr_before;
-#endif
-}
-
-EXPORT void rtk_debug_rawcounts(const char *stage, gtime_t time,
-                                int nobs, int nu, int nr)
-{
-#if ENABLE_RTK_DEBUG_OUTPUT
-    FILE *fp=fp_rtk_dbg;
-    if (!fp||!stage) return;
-    fprintf(fp,"RAWCOUNTS %s %s %d %d %d\n",
-            time_str(time,3),stage,nobs,nu,nr);
-    fflush(fp);
-#else
-    (void)stage; (void)time; (void)nobs; (void)nu; (void)nr;
-#endif
-}
-
-EXPORT void rtk_debug_rawset(const char *stage, gtime_t time,
-                             const obsd_t *obs, int nobs)
-{
-#if ENABLE_RTK_DEBUG_OUTPUT
-    int i;
-    char id[32];
-    FILE *fp=fp_rtk_dbg;
-    if (!fp||!stage||!obs||nobs<=0) return;
-    fprintf(fp,"RAWSATSET %s %s %d",time_str(time,3),stage,nobs);
-    for (i=0;i<nobs;i++) {
-        satno2id(obs[i].sat,id);
-        fprintf(fp," %s",id);
-    }
-    fputc('\n',fp);
-    fflush(fp);
-#else
-    (void)stage; (void)time; (void)obs; (void)nobs;
-#endif
-}
-
-EXPORT void rtk_debug_rawline(const char *stage, gtime_t time,
-                              const char *satid, int preset_sat,
-                              int decoded_sat, int ok)
-{
-#if ENABLE_RTK_DEBUG_OUTPUT
-    FILE *fp=fp_rtk_dbg;
-    if (!fp||!stage) return;
-    fprintf(fp,"RAWLINE %s %s %s %d %d %d\n",
-            time_str(time,3),stage,satid&&*satid?satid:"---",
-            preset_sat,decoded_sat,ok);
-    fflush(fp);
-#else
-    (void)stage; (void)time; (void)satid; (void)preset_sat; (void)decoded_sat; (void)ok;
-#endif
-}
-
-EXPORT void rtk_debug_counts(const rtk_t *rtk, const char *stage,
-                             int nobs, int nu, int nr)
-{
-#if ENABLE_RTK_DEBUG_OUTPUT
-    if (!fp_rtk_dbg||!rtk||!stage) return;
-    fprintf(fp_rtk_dbg,"COUNTS %s %s %d %d %d\n",
-            time_str(rtk->sol.time,3),stage,nobs,nu,nr);
-    fflush(fp_rtk_dbg);
-#else
-    (void)rtk; (void)stage; (void)nobs; (void)nu; (void)nr;
-#endif
-}
-
-EXPORT void rtk_debug_ambfix(gtime_t time, float ratio, float threshold,
-                             int dd_index, int dd_count, const char *refsat,
-                             const char *sat, int freq, double float_cycles,
-                             double integer_cycles)
-{
-#if ENABLE_RTK_DEBUG_OUTPUT
-    if (!fp_rtk_dbg) return;
-    fprintf(fp_rtk_dbg,
-        "AMB_FIX %s %.3f %.3f %d %d %s %s %d %.6f %.0f %.6f\n",
-        time_str(time,3),ratio,threshold,dd_index,dd_count,
-        refsat&&*refsat?refsat:"---",sat&&*sat?sat:"---",freq,
-        float_cycles,integer_cycles,float_cycles-integer_cycles);
-    fflush(fp_rtk_dbg);
-#else
-    (void)time; (void)ratio; (void)threshold; (void)dd_index; (void)dd_count;
-    (void)refsat; (void)sat; (void)freq; (void)float_cycles; (void)integer_cycles;
-#endif
-}
-
-EXPORT void rtk_debug_ambtruth(gtime_t time, const char *refsat,
-                               const char *sat, int freq, double truth_cycles)
-{
-#if ENABLE_RTK_DEBUG_OUTPUT
-    if (!fp_rtk_dbg) return;
-    fprintf(fp_rtk_dbg, "AMB_TRUTH %s %s %s %d %.6f\n", time_str(time,3),
-        refsat&&*refsat?refsat:"---", sat&&*sat?sat:"---", freq, truth_cycles);
-    fflush(fp_rtk_dbg);
-#else
-    (void)time; (void)refsat; (void)sat; (void)freq; (void)truth_cycles;
-#endif
-}
-
-/* Export the exact float DD ambiguity vector and covariance passed to LAMBDA. */
-EXPORT void rtk_debug_float_amb(gtime_t time, int nb, const double *amb,
-                                const double *Q)
-{
-#if ENABLE_RTK_DEBUG_OUTPUT
-    static unsigned long long seq = 0;
-    unsigned long long id = ++seq;
-    int i, j;
-    if (!fp_rtk_dbg || !amb || !Q || nb <= 0) return;
-    for (i = 0; i < nb; i++) {
-        fprintf(fp_rtk_dbg, "AMB_FLOAT %llu %s %d %d %.17g\n",
-            id, time_str(time,3), nb, i + 1, amb[i]);
-    }
-    for (i = 0; i < nb; i++) for (j = 0; j < nb; j++) {
-        fprintf(fp_rtk_dbg, "AMB_COV %llu %s %d %d %d %.17g\n",
-            id, time_str(time,3), nb, i + 1, j + 1, Q[i + j * nb]);
-    }
-    fflush(fp_rtk_dbg);
-#else
-    (void)time; (void)nb; (void)amb; (void)Q;
-#endif
-}
-
-/* Monte Carlo diagnostic for the final ambiguity set of one epoch. */
-static void rtk_debug_mc_epoch_legacy(gtime_t time, int nb, const double *Q,
-                                      int samples, double ratio_threshold)
-{
-#if ENABLE_RTK_DEBUG_OUTPUT && ENABLE_RTK_ONLINE_MC
-    double *L=NULL,*eta=NULL,*F=NULL,s[2],u1,u2,gauss;
-    int i,j,m,info,accepted=0,correct=0;
-    static unsigned long long seq=0;
-    unsigned long long id=++seq;
-    if (!fp_rtk_dbg||!Q||nb<=0||nb>MAXSAT*NFREQ||samples<=0) return;
-    L=zeros(nb,nb); eta=zeros(nb,1); F=zeros(nb,2);
-    if (!L||!eta||!F) { free(L); free(eta); free(F); return; }
-    matcpy(L,Q,nb,nb);
-    /* lower-triangular Cholesky factor L, Q=L*L' */
-    for (i=0;i<nb;i++) {
-        for (j=0;j<=i;j++) {
-            double v=L[i+j*nb];
-            int k;
-            for (k=0;k<j;k++) v-=L[i+k*nb]*L[j+k*nb];
-            if (i==j) {
-                if (v<=0.0) { free(L); free(eta); free(F); return; }
-                L[i+j*nb]=sqrt(v);
-            }
-            else L[i+j*nb]=v/L[j+j*nb];
-        }
-        for (j=i+1;j<nb;j++) L[i+j*nb]=0.0;
-    }
-    fprintf(fp_rtk_dbg,"MC_EPOCH %llu %s %d %d %.6g\n",
-        id,time_str(time,3),nb,samples,ratio_threshold);
-    for (m=0;m<samples;m++) {
-        for (i=0;i<nb;i++) {
-            double z=0.0;
-            for (j=0;j<=i;j++) {
-                u1=((double)rand()+1.0)/((double)RAND_MAX+2.0);
-                u2=((double)rand()+1.0)/((double)RAND_MAX+2.0);
-                gauss=sqrt(-2.0*log(u1))*cos(2.0*PI*u2);
-                z+=L[i+j*nb]*gauss;
-            }
-            eta[i]=z;
-        }
-        info=lambda(nb,2,eta,Q,F,s);
-        if (info||s[0]<=0.0||s[1]/s[0]<ratio_threshold) continue;
-        accepted++;
-        {
-            int iszero=1;
-            for (i=0;i<nb;i++) if (F[i]!=0.0) { iszero=0; break; }
-            if (iszero) correct++;
-        }
-        fprintf(fp_rtk_dbg,"MC_OFFSET %llu %d",id,m+1);
-        for (i=0;i<nb;i++) fprintf(fp_rtk_dbg," %.0f",F[i]);
-        fprintf(fp_rtk_dbg,"\n");
-    }
-    fprintf(fp_rtk_dbg,"MC_RESULT %llu %s %d %d %d %d %d %.17g %.17g\n",
-        id,time_str(time,3),nb,samples,accepted,correct,accepted-correct,
-        accepted/(double)samples,accepted?correct/(double)accepted:0.0);
-    fflush(fp_rtk_dbg);
-    free(L); free(eta); free(F);
-#else
-    (void)time; (void)nb; (void)Q; (void)samples; (void)ratio_threshold;
-#endif
-}
-
-EXPORT void rtk_debug_mc_epoch(gtime_t time, int na, int nb, const double *Qab,
-                              const double *Q, int samples, double ratio_threshold)
-{
-#if ENABLE_RTK_DEBUG_OUTPUT && ENABLE_RTK_ONLINE_MC
-    enum { MC_MAX_MODES = 20000 };
-    double *L=NULL,*eta=NULL,*F=NULL,*Qi=NULL,*dv=NULL,s[2];
-    int *modes=NULL,*counts=NULL,mode_n=0,i,j,m,info,accepted=0,correct=0;
-    static unsigned long long seq=0;
-    unsigned long long id=++seq;
-    if (!fp_rtk_dbg||!Q||nb<=0||nb>MAXSAT*NFREQ||samples<=0) return;
-    L=zeros(nb,nb); eta=zeros(nb,1); F=zeros(nb,2);
-    Qi=mat(nb,nb); dv=zeros(na>0?na:1,1);
-    modes=imat(nb,MC_MAX_MODES); counts=imat(1,MC_MAX_MODES);
-    if (!L||!eta||!F||!Qi||!dv||!modes||!counts) goto done;
-    matcpy(L,Q,nb,nb);
-    for (i=0;i<nb;i++) {
-      for (j=0;j<=i;j++) {
-        double v=L[i+j*nb]; int k;
-        for (k=0;k<j;k++) v-=L[i+k*nb]*L[j+k*nb];
-        if (i==j) { if (v<=0.0) goto done; L[i+j*nb]=sqrt(v); }
-        else L[i+j*nb]=v/L[j+j*nb];
-      }
-      for (j=i+1;j<nb;j++) L[i+j*nb]=0.0;
-    }
-    matcpy(Qi,Q,nb,nb);
-    if (matinv(Qi,nb)) goto done;
-    fprintf(fp_rtk_dbg,"MC_EPOCH %llu %s %d %d %.6g\n",
-        id,time_str(time,3),nb,samples,ratio_threshold);
-    for (m=0;m<samples;m++) {
-        for (i=0;i<nb;i++) {
-            double z=0.0,u1,u2,g;
-            for (j=0;j<=i;j++) {
-                u1=((double)rand()+1.0)/((double)RAND_MAX+2.0);
-                u2=((double)rand()+1.0)/((double)RAND_MAX+2.0);
-                g=sqrt(-2.0*log(u1))*cos(2.0*PI*u2);
-                z+=L[i+j*nb]*g;
-            }
-            eta[i]=z;
-        }
-        info=lambda(nb,2,eta,Q,F,s);
-        if (info||s[0]<=0.0||s[1]/s[0]<ratio_threshold) continue;
-        accepted++;
-        for (i=0;i<mode_n;i++) {
-            int same=1; for (j=0;j<nb;j++) if (modes[j+i*nb]!=(int)F[j]) {same=0;break;}
-            if (same) break;
-        }
-        if (i==mode_n && mode_n<MC_MAX_MODES) {
-            for (j=0;j<nb;j++) modes[j+mode_n*nb]=(int)F[j];
-            counts[mode_n]=1; mode_n++;
-        }
-        else if (i<mode_n) counts[i]++;
-        if (mode_n>0) { int zero=1; for (j=0;j<nb;j++) if (F[j]!=0.0) zero=0; if (zero) correct++; }
-    }
-    for (i=0;i<mode_n;i++) {
-        double dx=0.0,dy=0.0,dz=0.0,norm=0.0;
-        if (Qab&&na>0) for (j=0;j<na;j++) {
-            int k; dv[j]=0.0;
-            for (k=0;k<nb;k++) for (m=0;m<nb;m++) dv[j]-=Qab[j+k*na]*Qi[k+m*nb]*modes[m+i*nb];
-            if (j==0) dx=dv[j]; else if (j==1) dy=dv[j]; else if (j==2) dz=dv[j];
-        }
-        norm=sqrt(dx*dx+dy*dy+dz*dz);
-        fprintf(fp_rtk_dbg,"MC_MODE %llu %s %d",id,time_str(time,3),nb);
-        for (j=0;j<nb;j++) fprintf(fp_rtk_dbg," %d",modes[j+i*nb]);
-        fprintf(fp_rtk_dbg," %d %.17g %.17g %.17g %.17g %.17g\n",counts[i],counts[i]/(double)samples,dx,dy,dz,norm);
-    }
-    fprintf(fp_rtk_dbg,"MC_RESULT %llu %s %d %d %d %d %d %.17g %.17g\n",
-        id,time_str(time,3),nb,samples,accepted,correct,accepted-correct,
-        accepted/(double)samples,accepted?correct/(double)accepted:0.0);
-    fflush(fp_rtk_dbg);
-done:
-    free(L); free(eta); free(F); free(Qi); free(dv); free(modes); free(counts);
-#else
-    (void)time; (void)na; (void)nb; (void)Qab; (void)Q; (void)samples; (void)ratio_threshold;
-#endif
-}
-
-EXPORT void rtkim_out(const rtk_t *rtk)
+EXPORT void rtkimout(const rtk_t *rtk)
 {
     const rtkim_t *mon=&rtk->intg;
     const rtkim_pl_t *pl=&mon->pl;
-    if (!rtk->opt.enable_rtk_integrity_monitor||!mon->init) return;
+    int ndef=RTK_INT_METHOD==RTK_INT_METHOD_GLS_SS?mon->glsexp:mon->ndef;
+    int nact=RTK_INT_METHOD==RTK_INT_METHOD_GLS_SS?mon->glsvalid:mon->nact;
+    if (!rtk->opt.intmon||!mon->init) return;
     if (fp_pint) {
         int phase_count=0;
-        double phase_r=phase_rms(rtk,&phase_count);
-        fprintf(fp_pint,"%-23s %12.4f %12.4f %12.4f %4d %2d %7.3f %9.4f %6d %6d %8.4f %8.4f %7d %6d %13.6f %6d %10d %9d %9d\n",
-            time_str(mon->ep.time,3),rtk->sol.rr[0],rtk->sol.rr[1],rtk->sol.rr[2],
-            rtk->sol.ns,rtk->sol.stat,rtk->sol.ratio,rtk->sol.chi2testvalue,
-            mon->ndef,mon->nact,pl->hpl,pl->vpl,mon->fde.mode,mon->fde.sat,
-            phase_r,phase_count,rtk->int_fde_pre_mode,rtk->int_fde_pre_sat,
-            rtk->int_fde_action);
+        double phase_r=phaserms(rtk,&phase_count);
+        fprintf(fp_pint,
+                "%-23s %12.4f %12.4f %12.4f %4d %2d %7.3f %9.4f %6d %6d %8.4f "
+                "%8.4f %7d %6d %13.6f %6d %10d %9d %9d\n",
+                time_str(mon->ep.time,3),rtk->sol.rr[0],rtk->sol.rr[1],
+                rtk->sol.rr[2],rtk->sol.ns,rtk->sol.stat,rtk->sol.ratio,
+                rtk->sol.chi2testvalue,ndef,nact,pl->hpl,pl->vpl,
+                mon->fde.mode,mon->fde.sat,phase_r,phase_count,
+                rtk->intfdemode0,rtk->intfdesat0,rtk->intfdeact);
     }
     if (fp_pld) {
-        fprintf(fp_pld,"%-23s %4d %2d %7.3f %6d %6d %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %5d %5d %4d %5d %4d %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %4d %5d %4d %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %10d %9d %9d\n",
-            time_str(mon->ep.time,3),rtk->sol.ns,rtk->sol.stat,rtk->sol.ratio,
-            mon->ndef,mon->nact,pl->hpl,pl->vpl,pl->be,pl->bn,pl->bu,pl->hpl0,
-            pl->vpl0,pl->hadd,pl->vadd,pl->bias_loaded,pl->bias_rows,
-            pl->hsrc,pl->hmode,pl->hsat,pl->msig[0],pl->msig[1],pl->msig[2],
-            pl->hsig[0],pl->hsig[1],pl->hsig[2],pl->hsss[0],pl->hsss[1],pl->hsss[2],
-            pl->hsep[0],pl->hsep[1],pl->hsep[2],pl->vsrc,
-            pl->vmode,pl->vsat,pl->vsig[0],pl->vsig[1],pl->vsig[2],
-            pl->vsss[0],pl->vsss[1],pl->vsss[2],pl->vsep[0],pl->vsep[1],pl->vsep[2],rtk->int_fde_pre_mode,
-            rtk->int_fde_pre_sat,rtk->int_fde_action);
+        fprintf(fp_pld,
+                "%-23s %4d %2d %7.3f %6d %6d %8.4f %8.4f %8.4f %8.4f %8.4f "
+                "%8.4f %8.4f %8.4f %8.4f %5d %5d %4d %5d %4d %8.4f %8.4f "
+                "%8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f "
+                "%4d %5d %4d %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f "
+                "%8.4f %10d %9d %9d\n",
+                time_str(mon->ep.time,3),rtk->sol.ns,rtk->sol.stat,
+                rtk->sol.ratio,ndef,nact,pl->hpl,pl->vpl,pl->be,pl->bn,
+                pl->bu,pl->hpl0,pl->vpl0,pl->hadd,pl->vadd,pl->biasload,
+                pl->nbias,pl->hsrc,pl->hmode,pl->hsat,pl->msig[0],
+                pl->msig[1],pl->msig[2],pl->hsig[0],pl->hsig[1],
+                pl->hsig[2],pl->hsss[0],pl->hsss[1],pl->hsss[2],
+                pl->hsep[0],pl->hsep[1],pl->hsep[2],pl->vsrc,pl->vmode,
+                pl->vsat,pl->vsig[0],pl->vsig[1],pl->vsig[2],pl->vsss[0],
+                pl->vsss[1],pl->vsss[2],pl->vsep[0],pl->vsep[1],
+                pl->vsep[2],rtk->intfdemode0,rtk->intfdesat0,
+                rtk->intfdeact);
     }
     subout(rtk);
+    if (fp_gls)
+        fprintf(fp_gls,
+                "%s %d %d %d %d %d %d %.9g %.6f %.9g %.9g %d %d %d %d %d %d "
+                "%d %d %d %d %d %.9g %.9g %.9g %.9g\n",
+                time_str(mon->ep.time,3),mon->bnv,mon->glsexp,
+                mon->glsvalid,mon->glsmiss,mon->glsalert,mon->ep.fixed,
+                mon->glsmatch,mon->glstime,pl->hpl,pl->vpl,pl->hmode,
+                pl->hsat,mon->glshsat2,pl->vmode,pl->vsat,mon->glsvsat2,
+                mon->glsgeofail,mon->glssolfail,mon->glscovfail,
+                mon->glsobsalert,mon->glsfixalert,mon->glsobsratio,
+                mon->glsfixratio,pl->hpl0,pl->vpl0);
 }
 
 #endif
-

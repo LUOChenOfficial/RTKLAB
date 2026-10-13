@@ -15,7 +15,7 @@
 
 struct rtk_tag;
 
-typedef struct {
+typedef struct {        /* integrity fault hypothesis */
     int id;
     int mode;
     int sat;
@@ -24,14 +24,14 @@ typedef struct {
 
 typedef struct {
     int init,act,ready,valid;
-    struct rtk_tag *rtk;
-    double pos[3];
-    double q[6];
-    double sig[3];
+    struct rtk_tag *rtk; /* persistent child filter (FILTER_SS only) */
+    double pos[3];     /* subset ECEF position (m) */
+    double q[6];       /* packed ECEF covariance (m^2) */
+    double sig[3];     /* ENU position standard deviations (m) */
     int qi;
     double ratio;
     double pdop,hdop,vdop;
-    double sep[3];
+    double sep[3];     /* ENU solution separation (m) */
     double sig0,chisq;
     int dof;
     int refsat[8];
@@ -44,18 +44,18 @@ typedef struct {
     int qi;
     double ratio;
     int fixed;
-    int fixed_upd;
+    int fixupd;
 } rtkim_ep_t;
 
 typedef struct {
-    double hpl,vpl;
+    double hpl,vpl;    /* horizontal/vertical protection levels (m) */
     double hpl0,vpl0;
     double hadd,vadd;
     double be,bn,bu;
     double pe,pn,pu;
     double msig[3];
     double hsss[3],vsss[3];
-    int bias_loaded,bias_rows;
+    int biasload,nbias;
     int hsrc,hmode,hsat;
     int vsrc,vmode,vsat;
     double hsig[3],vsig[3];
@@ -85,9 +85,17 @@ typedef struct {
     int retry;
     int bnx,bnv;
     int bflg[RTKIM_MAX_BIAS_ROWS];
-    double *bH,*bR,*bv;
+    double *bH,*bR,*bv; /* DD H (bnx x bnv), R (bnv x bnv, m^2), v (m) */
+    int slready,slnv;    /* slope model ready flag and observation count */
+    double *slK,*slQi; /* position gain (3 x slnv), precision (slnv x slnv) */
+    int glsready,glsexp,glsvalid,glsmiss,glsalert,glshsat2,glsvsat2;
+    double glspos[3],glscov[9]; /* ECEF position (m), covariance (m^2) */
+    double glsmatch,glstime; /* main-update mismatch (m), elapsed time (s) */
+    double *glsQ,*glsF; /* innovation covariance (bnv x bnv), P*H (3 x bnv) */
+    int glsgeofail,glssolfail,glscovfail;
+    int glsobsalert,glsfixalert;
+    double glsobsratio,glsfixratio;
 } rtkim_t;
 
 #endif
 #endif
-

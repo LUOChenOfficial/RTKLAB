@@ -156,8 +156,8 @@ static int apply_skip_epoch_experiment(obsd_t *obs, int nobs,
         obs[n++]=obs[i];
     }
     skip_epoch_applied=1;
-    rtk_debug_rawcounts("exp_after_drop",obs[0].time,n,n,removed);
-    rtk_debug_rawset("exp_after_drop",obs[0].time,obs,n);
+    rtkdbgrawcounts("exp_after_drop",obs[0].time,n,n,removed);
+    rtkdbgrawset("exp_after_drop",obs[0].time,obs,n);
     return n;
 }
 #endif
@@ -345,18 +345,18 @@ static int inputobs(obsd_t *obs, int solq, const prcopt_t *popt)
             nr=nextobsf(&obss,&iobsr,2);
         }
         if (nu>0) {
-            rtk_debug_rawcounts("raw_rover",obss.data[iobsu].time,nu,nu,0);
-            rtk_debug_rawset("raw_rover",obss.data[iobsu].time,obss.data+iobsu,nu);
+            rtkdbgrawcounts("raw_rover",obss.data[iobsu].time,nu,nu,0);
+            rtkdbgrawset("raw_rover",obss.data[iobsu].time,obss.data+iobsu,nu);
         }
         if (nr>0) {
-            rtk_debug_rawcounts("raw_base",obss.data[iobsr].time,nr,0,nr);
-            rtk_debug_rawset("raw_base",obss.data[iobsr].time,obss.data+iobsr,nr);
+            rtkdbgrawcounts("raw_base",obss.data[iobsr].time,nr,0,nr);
+            rtkdbgrawset("raw_base",obss.data[iobsr].time,obss.data+iobsr,nr);
         }
         for (i=0;i<nu&&n<MAXOBS*2;i++) obs[n++]=obss.data[iobsu+i];
         for (i=0;i<nr&&n<MAXOBS*2;i++) obs[n++]=obss.data[iobsr+i];
         if (n>0) {
-            rtk_debug_rawcounts("raw_pair",obs[0].time,n,nu,nr);
-            rtk_debug_rawset("raw_pair",obs[0].time,obs,n);
+            rtkdbgrawcounts("raw_pair",obs[0].time,n,nu,nr);
+            rtkdbgrawset("raw_pair",obs[0].time,obs,n);
         }
         iobsu+=nu;
         
@@ -394,18 +394,18 @@ static int inputobs(obsd_t *obs, int solq, const prcopt_t *popt)
         }
         nr=nextobsb(&obss,&iobsr,2);
         if (nu>0) {
-            rtk_debug_rawcounts("raw_rover_b",obss.data[iobsu-nu+1].time,nu,nu,0);
-            rtk_debug_rawset("raw_rover_b",obss.data[iobsu-nu+1].time,obss.data+iobsu-nu+1,nu);
+            rtkdbgrawcounts("raw_rover_b",obss.data[iobsu-nu+1].time,nu,nu,0);
+            rtkdbgrawset("raw_rover_b",obss.data[iobsu-nu+1].time,obss.data+iobsu-nu+1,nu);
         }
         if (nr>0) {
-            rtk_debug_rawcounts("raw_base_b",obss.data[iobsr-nr+1].time,nr,0,nr);
-            rtk_debug_rawset("raw_base_b",obss.data[iobsr-nr+1].time,obss.data+iobsr-nr+1,nr);
+            rtkdbgrawcounts("raw_base_b",obss.data[iobsr-nr+1].time,nr,0,nr);
+            rtkdbgrawset("raw_base_b",obss.data[iobsr-nr+1].time,obss.data+iobsr-nr+1,nr);
         }
         for (i=0;i<nu&&n<MAXOBS*2;i++) obs[n++]=obss.data[iobsu-nu+1+i];
         for (i=0;i<nr&&n<MAXOBS*2;i++) obs[n++]=obss.data[iobsr-nr+1+i];
         if (n>0) {
-            rtk_debug_rawcounts("raw_pair_b",obs[0].time,n,nu,nr);
-            rtk_debug_rawset("raw_pair_b",obs[0].time,obs,n);
+            rtkdbgrawcounts("raw_pair_b",obs[0].time,n,nu,nr);
+            rtkdbgrawset("raw_pair_b",obs[0].time,obs,n);
         }
         iobsu-=nu;
         
@@ -581,7 +581,7 @@ static void procpos(FILE *fp, FILE *fptm, const prcopt_t *popt, const solopt_t *
             if (!solstatic) {
                 outsol(fp,&rtk->sol,rtk->rb,sopt);
 #ifdef ENABLE_RTK_INTEGRITY
-                rtkim_out(rtk);
+                rtkimout(rtk);
 #endif
             }
             else if (time.time==0||pri[rtk->sol.stat]<=pri[sol.stat]) {
@@ -1289,10 +1289,10 @@ static int execses(gtime_t ts, gtime_t te, double ti, const prcopt_t *popt,
         rtkopenstat(statfile,sopt->sstat);
     }
 #if ENABLE_RTK_DEBUG_OUTPUT
-    rtk_debug_open(outfile);
+    rtkdbgopen(outfile);
 #endif
 #ifdef ENABLE_RTK_INTEGRITY
-    if (flag) rtkim_open(outfile,&popt_);
+    if (flag) rtkimopen(outfile,&popt_);
 #endif
     /* write header to output file */
     if (flag&&!outhead(outfile,infile,n,&popt_,sopt)) {
@@ -1352,10 +1352,10 @@ static int execses(gtime_t ts, gtime_t te, double ti, const prcopt_t *popt,
     }
     rtkfree(&rtk);
 #if ENABLE_RTK_DEBUG_OUTPUT
-    rtk_debug_close();
+    rtkdbgclose();
 #endif
 #ifdef ENABLE_RTK_INTEGRITY
-    rtkim_close();
+    rtkimclose();
 #endif
     /* free obs and nav data */
     freeobsnav(&obss,&navs);

@@ -64,7 +64,7 @@ const int IGSO[] = { 6,7,8,9,10,13,16,38,39,40 };
 #define MAXACC      30.0     /* max accel for doppler slip detection (m/s^2) */
 
 #define TTOL_MOVEB  (1.0+2*DTTOL)
-							 /* time sync tolerance for moving-baseline (s) */
+							 /* time sync tol for moving-baseline (s) */
 
 /* number of parameters (pos,ionos,tropos,hw-bias,phase-bias,real,estimated) */
 #define NF(opt)     ((opt)->ionoopt==IONOOPT_IFLC?1:(opt)->nf)
@@ -112,7 +112,7 @@ static char file_stat[1024] = "";  /* rtk status file original path */
 static gtime_t time_stat = { 0 };    /* rtk status file time */
 #define AR_MAX_CP_RMS RTK_AR_CP_RMS_GATE_THRESH
 
-static double residual_rms(const rtk_t *rtk, int phase, int *count)
+static double resrms(const rtk_t *rtk, int phase, int *count)
 {
     double s=0.0;
     int i,f,n=0,nf=NF(&rtk->opt);
@@ -378,7 +378,7 @@ static void outsolstat(rtk_t* rtk, const nav_t* nav)
 	int i, j, k, n, week, nfreq, nf = NF(&rtk->opt), dgps;
 
 #ifdef ENABLE_RTK_INTEGRITY
-	if (rtk->int_child) return;
+	if (rtk->intchild) return;
 #endif
 	if (statlevel <= 0 || !fp_stat || !rtk->sol.stat) return;
 
@@ -1678,6 +1678,84 @@ static int test_sys(int sys, int m)
 	}
 	return 0;
 }
+#if ENABLE_RTK_RANSAC
+/* Carrier SD model ported from RANSACRTK. Historical default shares a
+ * system common ambiguity gauge (cycles); experimental switch splits frequency.
+ * Keep FDMA/IFLC/estimated-atmosphere
+ * observations unchanged until their additional model terms are supported. */
+static void ransac_sd(rtk_t *rtk, const nav_t *nav, const obsd_t *obs, double dt, const double *x, const int *sat, double *y, const double *e, const double *azel, const int *iu, const int *ir, int ns)
+{
+    const prcopt_t *opt=&rtk->opt;
+    double A[MAXSAT*NFREQ*8],v[MAXSAT*NFREQ],variance[MAXSAT*NFREQ],dr[3],bl;
+    int list[MAXSAT*NFREQ],group[MAXSAT*NFREQ],freqgrp[MAXSAT*NFREQ],columns[5*NFREQ],i,j,k,m,f,nv,np,kept,nf=NF(opt);
+    unsigned char keep[MAXSAT*NFREQ];
+    if (opt->mode<=PMODE_DGPS || opt->ionoopt==IONOOPT_IFLC ||
+        opt->ionoopt==IONOOPT_EST || opt->tropopt>=TROPOPT_EST) {
+        trace(3,"RANSAC %s bypass: unsupported observation model\n",time_str(rtk->sol.time,3));
+        return;
+    }
+    bl=baseline(x,rtk->rb,dr);
+    nv=0;
+    for (m=0;m<5*NFREQ;m++) columns[m]=-1;
+    for (f=0;f<nf;f++) {
+        for (i=0;i<ns;i++) {
+            int sys=rtk->ssat[sat[i]-1].sys;
+            double lam=nav->lam[sat[i]-1][f];
+            if (sys==SYS_GLO || sys==SYS_SBS || lam<=0.0 ||
+                !validobs(iu[i],ir[i],f,nf,y)) continue;
+            for (m=0;m<5;m++) if (test_sys(sys,m)) break;
+            if (m==5) continue;
+#if RTK_RANSAC_SPLIT_FREQUENCY
+            m=m*NFREQ+f;
+#endif
+            v[nv]=y[f+iu[i]*nf*2]-y[f+ir[i]*nf*2]-lam*x[IB(sat[i],f,opt)];
+            variance[nv]=varerr(sat[i],sys,azel[1+iu[i]*2],
+                0.25*rtk->ssat[sat[i]-1].snr_rover[f],
+                0.25*rtk->ssat[sat[i]-1].snr_base[f],
+                rtk->ssat[sat[i]-1].pld_rover[f],rtk->ssat[sat[i]-1].rv_rover[f],
+                rtk->ssat[sat[i]-1].cv_rover[f],bl,dt,f,opt,&obs[iu[i]]);
+            list[nv]=i; group[nv]=m; columns[m]=0; nv++;
+            freqgrp[nv-1]=f;
+        }
+    }
+    np=3;
+    for (m=0;m<5*NFREQ;m++) if (columns[m]>=0) columns[m]=np++;
+    if (np>8) return; /* kernel supports at most eight parameters */
+#if RTK_RANSAC_PRIOR_VARIANCE
+    /* Gauge-invariant ambiguity differences within the modeled group.
+     * Add their propagated prior variance rather than common gauge variance.
+     * This is an experimental scale, not a calibrated selection likelihood. */
+    for (j=0;j<nv;j++) {
+        int anchor=j,ib=IB(sat[list[j]],freqgrp[j],opt),ia;
+        double lam=nav->lam[sat[list[j]]-1][freqgrp[j]],la,pdiff;
+        for (k=0;k<nv;k++) if (group[k]==group[j]) {
+            int kb=IB(sat[list[k]],freqgrp[k],opt),ab=IB(sat[list[anchor]],freqgrp[anchor],opt);
+            if (rtk->P[kb+kb*rtk->nx]<rtk->P[ab+ab*rtk->nx]) anchor=k;
+        }
+        ia=IB(sat[list[anchor]],freqgrp[anchor],opt);
+        la=nav->lam[sat[list[anchor]]-1][freqgrp[anchor]];
+        pdiff=lam*lam*rtk->P[ib+ib*rtk->nx]+la*la*rtk->P[ia+ia*rtk->nx]
+             -lam*la*(rtk->P[ib+ia*rtk->nx]+rtk->P[ia+ib*rtk->nx]);
+        if (isfinite(pdiff) && pdiff>0.0) variance[j]+=pdiff;
+    }
+#endif
+    for (j=0;j<nv;j++) {
+        i=list[j];
+        for (k=0;k<np;k++) A[k+j*np]=0.0;
+        for (k=0;k<3;k++) A[k+j*np]=-e[k+iu[i]*3];
+        A[columns[group[j]]+j*np]=nav->lam[sat[i]-1][freqgrp[j]];
+    }
+    kept=rtkransac(A,v,variance,np,nv,
+        (unsigned int)rtk->sol.time.time ^ 19938,keep);
+    trace(3,"RANSAC %s ALL model=%d obs=%d kept=%d applied=%d\n",
+        time_str(rtk->sol.time,3),np,nv,kept,kept>0);
+    for (j=0;j<nv;j++) {
+        i=list[j];
+        rtk->ransacmask[sat[i]-1][freqgrp[j]]=keep[j];
+        rtkdbgransac(rtk->sol.time,sat[i],freqgrp[j]+1,np,nv,kept,keep[j],v[j],variance[j]);
+    }
+}
+#endif
 /* double-differenced residuals and partial derivatives  -----------------------------------
 		O rtk->ssat[i].resp[j] = residual pseudorange error
 		O rtk->ssat[i].resc[j] = residual carrier phase error
@@ -1748,6 +1826,9 @@ static int ddres(rtk_t* rtk, const nav_t* nav, const obsd_t* obs, double dt, con
 				sysi = rtk->ssat[sat[j] - 1].sys;
 				if (!test_sys(sysi, m) || sysi == SYS_SBS) continue;
 				if (!validobs(iu[j], ir[j], f, nf, y)) continue;
+#if ENABLE_RTK_RANSAC
+                if (!code && !rtk->ransacmask[sat[j]-1][frq]) continue;
+#endif
 				if (i < 0 || azel[1 + iu[j] * 2] >= azel[1 + iu[i] * 2]) i = j;
 			}
 			if (i < 0) continue;
@@ -1759,6 +1840,9 @@ static int ddres(rtk_t* rtk, const nav_t* nav, const obsd_t* obs, double dt, con
 				sysj = rtk->ssat[sat[j] - 1].sys;
 				if (!test_sys(sysj, m)) continue;
 				if (!validobs(iu[j], ir[j], f, nf, y)) continue;
+#if ENABLE_RTK_RANSAC
+                if (!code && !rtk->ransacmask[sat[j]-1][frq]) continue;
+#endif
 
 				lami = nav->lam[sat[i] - 1][frq];
 				lamj = nav->lam[sat[j] - 1][frq];
@@ -1964,7 +2048,7 @@ static int robust_KF2(rtk_t* rtk, const double* x, const double* P, const double
 	const double* H, double* R, int nx, int nv)
 {
 	double* vk, * P_, * R_, * Q_vk, * Q_vkk, * HP, * RQ, * H_, * Gamma;
-	double vi, k0 = 2.0/*2.0-3.0*/, k1 = 8.5/*4.5-8.5*/, gamma = 1.0, gamma_i = 1.0, gamma_j = 1.0, c = 3.5;
+	double vi, k0 = 2.0/*2.0-3.0*/, k1 = 8.5/*4.5-8.5*/, gamma = 1.0, gamma_i = 1.0, gamma_j = 1.0;
 	int i, j, n = nx, info = 1, * ix;
 
 	ix = imat(nx, 1);
@@ -1996,17 +2080,8 @@ static int robust_KF2(rtk_t* rtk, const double* x, const double* P, const double
 	for (i = 0; i < nv; i++) {
 		//20240321 by qq
 		vi = fabs(vk[i]) / SQRT(Q_vkk[i * nv + i]);
-		/*Huber*/
-		if (vi < c) {
-			gamma = 1.0;
-		}
-		else {
-			gamma = c / vi;
-			printf("down----\r\n");
-		}
-
 		/*IGG3*/
-		/*if (vi < k0)
+		if (vi < k0)
 		{
 			gamma = 1.0;
 		}
@@ -2019,7 +2094,7 @@ static int robust_KF2(rtk_t* rtk, const double* x, const double* P, const double
 		{
 			gamma = k0 / vi * pow((k1 - vi) / (k1 - k0), 2);
 			printf("down----\r\n");
-		}*/
+		}
 		Gamma[i] = gamma;
 		//R[i*nv+i]=R[i*nv+i]/gamma;
 	}
@@ -2155,7 +2230,7 @@ static int ddmat(rtk_t* rtk, double* D)
 }
 
 /* write the DD ambiguities of an accepted LAMBDA candidate to .rtk_debug */
-static void debug_fixed_dd_ambiguities(const rtk_t *rtk, const double *D,
+static void dbgfixamb(const rtk_t *rtk, const double *D,
 	const double *float_dd, const double *integer_dd, int nb)
 {
 	int col, state, f, sat, ref_state, sat_state, ref_freq, sat_freq;
@@ -2182,13 +2257,13 @@ static void debug_fixed_dd_ambiguities(const rtk_t *rtk, const double *D,
 			}
 		}
 		if (ref_freq<0||ref_freq!=sat_freq) continue;
-		rtk_debug_ambfix(rtk->sol.time,rtk->sol.ratio,rtk->sol.thres,
+		rtkdbgambfix(rtk->sol.time,rtk->sol.ratio,rtk->sol.thres,
 			col+1,nb,ref_id,sat_id,ref_freq+1,float_dd[col],integer_dd[col]);
 	}
 }
 
 /* Export DD ambiguities only after the final solution status is fixed. */
-static void debug_final_fixed_dd_ambiguities(rtk_t *rtk, const double *xa)
+static void dbgfinalamb(rtk_t *rtk, const double *xa)
 {
 	int i, col, nb, nx=rtk->nx, na=rtk->na;
 	double *D=zeros(nx,nx), *float_dd, *integer_dd;
@@ -2213,7 +2288,7 @@ static void debug_final_fixed_dd_ambiguities(rtk_t *rtk, const double *xa)
 		/* xa can retain a held DD as a float value; export its final integer. */
 		integer_dd[col]=ROUND(integer_dd[col]);
 	}
-	debug_fixed_dd_ambiguities(rtk,D,float_dd,integer_dd,nb);
+	dbgfixamb(rtk,D,float_dd,integer_dd,nb);
 	free(D); free(float_dd); free(integer_dd);
 }
 
@@ -2224,7 +2299,7 @@ static double static_truth_xyz[STATIC_TRUTH_MAX*3];
 static int static_truth_count=-1;
 
 /* Load the nearest valid KSXT rover truth coordinate for an epoch. */
-static int static_truth_position(gtime_t time, double *rr)
+static int truthpos(gtime_t time, double *rr)
 {
 	const char *path="F:\\RTKLib-LAB\\result\\Static\\COM25-comB-1.dat";
 	FILE *fp;
@@ -2259,7 +2334,7 @@ static int static_truth_position(gtime_t time, double *rr)
 }
 
 /* Evaluate phase DD observations at the reference coordinate with ambiguity states zeroed. */
-static void debug_truth_constrained_dd_ambiguities(rtk_t *rtk, const nav_t *nav,
+static void dbgtruthamb(rtk_t *rtk, const nav_t *nav,
 	const obsd_t *obs, double dt, const int *sat, double *y, double *e,
 	double *azel, const int *iu, const int *ir, int ns)
 {
@@ -2268,7 +2343,7 @@ static void debug_truth_constrained_dd_ambiguities(rtk_t *rtk, const nav_t *nav,
 	char refid[16],satid[16];
 	ssat_t ssat[MAXSAT];
 
-	if (!static_truth_position(rtk->sol.time,rr)) return;
+	if (!truthpos(rtk->sol.time,rr)) return;
 	x=mat(rtk->nx,1); v=mat(ny,1); R=zeros(ny,ny);
 	if (!x||!v||!R) { free(x); free(v); free(R); return; }
 	matcpy(x,rtk->x,rtk->nx,1);
@@ -2284,7 +2359,7 @@ static void debug_truth_constrained_dd_ambiguities(rtk_t *rtk, const nav_t *nav,
 		lam=nav->lam[ref-1][f];
 		if (lam<=0.0) continue;
 		satno2id(ref,refid); satno2id(target,satid);
-		rtk_debug_ambtruth(rtk->sol.time,refid,satid,f+1,v[i]/lam);
+		rtkdbgambtruth(rtk->sol.time,refid,satid,f+1,v[i]/lam);
 	}
 	memcpy(rtk->ssat,ssat,sizeof(ssat));
 	memcpy(rtk->numnv,numnv,sizeof(numnv));
@@ -2480,7 +2555,7 @@ static double mc_final_amb[MAXSAT*NFREQ]={0};
 static double mc_final_Q[MAXSAT*NFREQ*MAXSAT*NFREQ]={0};
 static double mc_final_Qab[MAXSAT*NFREQ*2*MAXSAT*NFREQ]={0};
 
-static void mc_cache_ambiguities(int nb, const double *amb, const double *Q)
+static void mccacheamb(int nb, const double *amb, const double *Q)
 {
 	int i,j,maxn=MAXSAT*NFREQ;
 	if (nb<=0||nb>maxn||!amb||!Q) { mc_final_nb=0; return; }
@@ -2490,7 +2565,7 @@ static void mc_cache_ambiguities(int nb, const double *amb, const double *Q)
 		mc_final_Q[i+j*nb]=Q[i+j*nb];
 }
 
-static void mc_cache_qab(int na, int nb, const double *Qab)
+static void mccacheqab(int na, int nb, const double *Qab)
 {
     int i,j;
     if (!Qab||na<=0||nb<=0||na>MAXSAT*NFREQ*2||nb>MAXSAT*NFREQ) return;
@@ -2560,9 +2635,9 @@ static int resamb_LAMBDA(rtk_t* rtk, double* bias, double* xa)
 	for (i = 0; i < na; i++) for (j = 0; j < nb; j++) Qab[i + j * na] = Qy[i + (na + j) * ny];
 
 	/* Export the exact float DD input and full covariance used by LAMBDA. */
-	rtk_debug_float_amb(rtk->sol.time, nb, y + na, Qb);
-	mc_cache_ambiguities(nb, y + na, Qb);
-	mc_cache_qab(na, nb, Qab);
+	rtkdbgfloatamb(rtk->sol.time, nb, y + na, Qb);
+	mccacheamb(nb, y + na, Qb);
+	mccacheqab(na, nb, Qab);
 
 	trace(3, "N(0)=     "); tracemat(3, y + na, 1, nb, 7, 2);
 	trace(3, "Qb  =     "); tracemat(3, QQb, 1, nb, 7, 5);
@@ -2628,7 +2703,7 @@ static int resamb_LAMBDA(rtk_t* rtk, double* bias, double* xa)
 				}
 			}
 #ifdef ENABLE_RTK_INTEGRITY
-			if (rtk->int_child) flag = 0;
+			if (rtk->intchild) flag = 0;
 #endif
 			if (flag && rtk->nfix >= 10 && ddnum > 0) {
 				double* Test = mat(1, 1), * tmpmatrix = mat(1, ddnum);
@@ -2687,7 +2762,7 @@ static int resamb_LAMBDA(rtk_t* rtk, double* bias, double* xa)
 }
 
 #if ENABLE_RTK_PARTIAL_AR
-static int build_ar_matrices(rtk_t* rtk, double** amb_f_out, double** Qb_out, double** Qab_out, int* nb_out)
+static int armat(rtk_t* rtk, double** amb_f_out, double** Qb_out, double** Qab_out, int* nb_out)
 {
 	prcopt_t* opt = &rtk->opt;
 	int i, j, nx = rtk->nx, na = rtk->na, ny, nb;
@@ -2738,7 +2813,7 @@ static int build_ar_matrices(rtk_t* rtk, double** amb_f_out, double** Qb_out, do
 	return 1;
 }
 
-static int par_worst_amb(const double* amb_f, const double* Qb, const int* idxs, int nidx, int nb)
+static int parworst(const double* amb_f, const double* Qb, const int* idxs, int nidx, int nb)
 {
 	int i, iw = 0;
 	double smax = -1.0;
@@ -2756,7 +2831,7 @@ static int par_worst_amb(const double* amb_f, const double* Qb, const int* idxs,
 	return iw;
 }
 
-static int resamb_LAMBDA_subset(rtk_t* rtk, const double* amb_f, const double* Qb_full,
+static int resambpar(rtk_t* rtk, const double* amb_f, const double* Qb_full,
 	const double* Qab_full, int nb, const int* idxs, int nidx, double* bias_full, double* xa)
 {
 	int i, j, na = rtk->na, info;
@@ -2784,8 +2859,8 @@ static int resamb_LAMBDA_subset(rtk_t* rtk, const double* amb_f, const double* Q
 		}
 	}
 	/* Preserve the subset covariance before lambda/inversion changes it. */
-	mc_cache_ambiguities(nidx, a_sub, Qb_sub);
-	mc_cache_qab(na, nidx, Qab_sub);
+	mccacheamb(nidx, a_sub, Qb_sub);
+	mccacheqab(na, nidx, Qab_sub);
 
 	if ((info = lambda(nidx, 2, a_sub, Qb_sub, b, s)) != 0) {
 		free(a_sub); free(Qb_sub); free(Qab_sub); free(b); free(db); free(QQ);
@@ -2821,7 +2896,7 @@ static int resamb_LAMBDA_subset(rtk_t* rtk, const double* amb_f, const double* Q
 
 	restamb(rtk, bias_full, nb, xa);
 #if ENABLE_RTK_AR_CP_RMS_GATE
-	cp_rms = residual_rms(rtk, 1, NULL);
+	cp_rms = resrms(rtk, 1, NULL);
 	if (cp_rms >= AR_MAX_CP_RMS) {
 		errmsg(rtk, "PAR subset rejected by carrier-phase rms gate (nb=%d ratio=%.2f cp_rms=%.4f limit=%.4f)\n",
 			nidx, rtk->sol.ratio, cp_rms, AR_MAX_CP_RMS);
@@ -2834,7 +2909,7 @@ static int resamb_LAMBDA_subset(rtk_t* rtk, const double* amb_f, const double* Q
 	return nidx;
 }
 
-static int manage_amb_PAR(rtk_t* rtk, double* bias, double* xa)
+static int manageambpar(rtk_t* rtk, double* bias, double* xa)
 {
 	static const int par_max_removals = 15;
 	static const double par_max_remove_ratio = 0.75;
@@ -2843,7 +2918,7 @@ static int manage_amb_PAR(rtk_t* rtk, double* bias, double* xa)
 	double *amb_f = NULL, *Qb = NULL, *Qab = NULL;
 	int ret = 0;
 
-	if (!build_ar_matrices(rtk, &amb_f, &Qb, &Qab, &nb)) {
+	if (!armat(rtk, &amb_f, &Qb, &Qab, &nb)) {
 		return 0;
 	}
 	if (!(idxs = imat(nb, 1))) {
@@ -2864,13 +2939,13 @@ static int manage_amb_PAR(rtk_t* rtk, double* bias, double* xa)
 	ndel = 0;
 
 	while (nidx >= nmin && ndel <= nmax) {
-		ret = resamb_LAMBDA_subset(rtk, amb_f + rtk->na, Qb, Qab, nb, idxs, nidx, bias, xa);
+		ret = resambpar(rtk, amb_f + rtk->na, Qb, Qab, nb, idxs, nidx, bias, xa);
 		if (ret > 0) {
 			rtk->nb_ar = ret;
 			break;
 		}
 
-		iw = par_worst_amb(amb_f + rtk->na, Qb, idxs, nidx, nb);
+		iw = parworst(amb_f + rtk->na, Qb, idxs, nidx, nb);
 		for (k = iw; k < nidx - 1; k++) idxs[k] = idxs[k + 1];
 		nidx--;
 		ndel++;
@@ -3031,7 +3106,7 @@ static int manage_amb_LAMBDA(rtk_t* rtk, double* bias, double* xa, const int* sa
 	}
 
 	if (ENABLE_RTK_PARTIAL_AR && nb <= 0) {
-		nb = manage_amb_PAR(rtk, bias, xa);
+		nb = manageambpar(rtk, bias, xa);
 	}
 	rtk->sol.prev_ratio1 = ratio1 > 0 ? ratio1 : rtk->sol.ratio;
 	rtk->sol.prev_ratio2 = rtk->sol.ratio;
@@ -3092,12 +3167,12 @@ static int valpos(rtk_t* rtk, const double* v, const double* R, const int* vflg,
 				time_str(rtk->sol.time, 2), nv, NP(opt), dof, chi2, chi2_thres);
 		}
 	}
-	rtk_debug_valtest(rtk->sol.time,stage?stage:"unknown",rtk->sol.stat,rtk->sol.ratio,
+	rtkdbgvaltest(rtk->sol.time,stage?stage:"unknown",rtk->sol.stat,rtk->sol.ratio,
 		nv,NP(opt),dof>0?dof:0,chi2,chi2_thres,stat,v,R,vflg,5);
 	return stat;
 }
 
-static int select_fix_valres(const rtk_t *rtk, const double *v, const double *R,
+static int selfixres(const rtk_t *rtk, const double *v, const double *R,
 	const int *vflg, int nv, double *vs, double *Rs, int *vflgs)
 {
 	int i, j, ns = 0, *map;
@@ -3149,6 +3224,15 @@ static int relpos(rtk_t* rtk, const obsd_t* obs, int nu, int nr,
 
 	trace(3, "relpos  : nx=%d nu=%d nr=%d\n", rtk->nx, nu, nr);
 
+    /* Experimental FILTER_SS children inherit this epoch's main consensus. */
+    if (!ENABLE_RTK_RANSAC_ARAIM || !rtk->intchild)
+        memset(rtk->ransacmask,1,sizeof(rtk->ransacmask));
+#if ENABLE_RTK_RANSAC_SLOPE
+    rtk->intg.slready=0;
+#endif
+#if RTK_INT_METHOD==RTK_INT_METHOD_GLS_SS
+    rtk->intg.glsready=0;
+#endif
 	/* time diff between base and rover observations (usually zero) */
 	dt = timediff(time, obs[nu].time);
 
@@ -3255,6 +3339,11 @@ static int relpos(rtk_t* rtk, const obsd_t* obs, int nu, int nr,
 			stat = SOLQ_NONE;
 			break;
 		}
+#if ENABLE_RTK_RANSAC
+        /* Keep one predicted-state mask through KF and post-fit validation. */
+        if (i==0 && (!ENABLE_RTK_RANSAC_ARAIM || !rtk->intchild))
+            ransac_sd(rtk,nav,obs,dt,xp,sat,y,e,azel,iu,ir,ns);
+#endif
 		/* calculate double-differenced residuals and create state matrix from sat angles
 				O rtk->ssat[i].resp[j] = residual pseudorange error
 				O rtk->ssat[i].resc[j] = residual carrier phase error
@@ -3276,7 +3365,7 @@ static int relpos(rtk_t* rtk, const obsd_t* obs, int nu, int nr,
 			break;
 		}
 #ifdef ENABLE_RTK_INTEGRITY
-		rtkim_saveddr(rtk,H,R,v,vflg,rtk->nx,nv);
+		rtkimsaveddr(rtk,H,R,v,vflg,rtk->nx,nv);
 #endif
 
 		/* kalman filter measurement update, updates x,y,z,sat phase biases, etc
@@ -3285,13 +3374,19 @@ static int relpos(rtk_t* rtk, const obsd_t* obs, int nu, int nr,
 				Pp=(I-K*H')*P*/
 				//20240321-byqq
 		matcpy(Pp, rtk->P, rtk->nx, rtk->nx);
-#ifdef Open_Robust
+#if Open_Robust
 		if (rtk->nx > 0) { /* robust algorithm after first ar*/
 			info = robust_KF2(rtk, xp, Pp, v, H, R, rtk->nx, nv);
 		}
 #endif
 
 		/* 标准卡尔曼滤波 */
+#if ENABLE_RTK_RANSAC_SLOPE
+        rtkimslprior(rtk,xp,Pp,H,R,rtk->nx,nv);
+#endif
+#if RTK_INT_METHOD==RTK_INT_METHOD_GLS_SS
+        rtkimglsprior(rtk,xp,Pp,H,R,rtk->nx,nv);
+#endif
 		if ((info = filter(xp, Pp, H, v, R, rtk->nx, nv, rtk))) {
 			errmsg(rtk, "filter error (info=%d)\n", info);
 			stat = SOLQ_NONE;
@@ -3376,13 +3471,13 @@ static int relpos(rtk_t* rtk, const obsd_t* obs, int nu, int nr,
 					vflgf = imat(nv, 1);
 				}
 				if (vf && Rf && vflgf) {
-					nvf = select_fix_valres(rtk, v, R, vflg, nv, vf, Rf, vflgf);
+					nvf = selfixres(rtk, v, R, vflg, nv, vf, Rf, vflgf);
 				}
 
 				/* validation of fixed solution, always returns valid */
 				if (nvf > 0 && valpos(rtk, vf, Rf, vflgf, nvf, 4.0, "fix")) {
 #if ENABLE_RTK_AR_CP_RMS_GATE
-					cp_rms_fix = residual_rms(rtk, 1, NULL);
+					cp_rms_fix = resrms(rtk, 1, NULL);
 					if (cp_rms_fix >= AR_MAX_CP_RMS) {
 						errmsg(rtk, "fixed solution rejected by final carrier-phase rms gate (ratio=%.2f cp_rms=%.4f limit=%.4f)\n",
 							rtk->sol.ratio, cp_rms_fix, AR_MAX_CP_RMS);
@@ -3404,7 +3499,7 @@ static int relpos(rtk_t* rtk, const obsd_t* obs, int nu, int nr,
 						}
 						stat = SOLQ_FIX;
 #ifdef ENABLE_RTK_INTEGRITY
-						rtkim_export_rbias(rtk,vf,vflgf,nvf);
+						rtkimoutbias(rtk,vf,vflgf,nvf);
 #endif
 #if ENABLE_RTK_AR_CP_RMS_GATE
 					}
@@ -3416,11 +3511,11 @@ static int relpos(rtk_t* rtk, const obsd_t* obs, int nu, int nr,
 	}
 
 	if (stat==SOLQ_FIX) {
-		debug_final_fixed_dd_ambiguities(rtk,xa);
-		debug_truth_constrained_dd_ambiguities(rtk,nav,obs,dt,sat,y,e,azel,iu,ir,ns);
+		dbgfinalamb(rtk,xa);
+		dbgtruthamb(rtk,nav,obs,dt,sat,y,e,azel,iu,ir,ns);
 		/* Evaluate only the ambiguity set that survived all final validation. */
 		if (ENABLE_RTK_ONLINE_MC && mc_final_nb > 0) {
-			rtk_debug_mc_epoch(rtk->sol.time,mc_final_na,mc_final_nb,mc_final_Qab,mc_final_Q,
+			rtkdbgmcepoch(rtk->sol.time,mc_final_na,mc_final_nb,mc_final_Qab,mc_final_Q,
 				RTK_ONLINE_MC_SAMPLES,RTK_ONLINE_MC_RATIO);
 		}
 	}
@@ -3541,12 +3636,12 @@ rtk->xa = zeros(rtk->na, 1);
 	rtk->sol.thres = (float)opt->thresar[0];
 	for (i = 0; i < 4; i++) rtk->numnv[i] = 0;
 #ifdef ENABLE_RTK_INTEGRITY
-	rtk->int_child = 0;
-	rtk->int_reproc = 0;
-	rtk->int_fde_mode = RTKIM_F_NONE;
-	rtk->int_fde_sat = 0;
-	rtk->int_hpl = rtk->int_vpl = 0.0;
-	rtkim_init(rtk, opt);
+	rtk->intchild = 0;
+	rtk->intreproc = 0;
+	rtk->intfdemode = RTKIM_F_NONE;
+	rtk->intfdesat = 0;
+	rtk->inthpl = rtk->intvpl = 0.0;
+	rtkiminit(rtk, opt);
 #endif
 }
 /* free rtk control ------------------------------------------------------------
@@ -3566,7 +3661,7 @@ extern void rtkfree(rtk_t* rtk)
 	free(rtk->xa); rtk->xa = NULL;
 	free(rtk->Pa); rtk->Pa = NULL;
 #ifdef ENABLE_RTK_INTEGRITY
-	rtkim_free(rtk);
+	rtkimfree(rtk);
 #endif
 }
 /* precise positioning ---------------------------------------------------------
@@ -3731,37 +3826,37 @@ extern int rtkpos(rtk_t* rtk, const obsd_t* obs, int n, const nav_t* nav, const 
 	/* relative potitioning */
 	relpos(rtk, obs, nu, nr, nav);
 #if ENABLE_RTK_DEBUG_OUTPUT
-    if (!rtk->int_child&&rtk->int_reproc<=0) {
+    if (!rtk->intchild&&rtk->intreproc<=0) {
         double rr_normal[3]={rtk->sol.rr[0],rtk->sol.rr[1],rtk->sol.rr[2]};
-        rtk_debug_counts(rtk,"entry",n,nu,nr);
-        rtk_debug_epoch(rtk,"normal",0,0,n,n,
+        rtkdbgcounts(rtk,"entry",n,nu,nr);
+        rtkdbgepoch(rtk,"normal",0,0,n,n,
                         rtk->sol.stat,rtk->sol.ns,rtk->sol.ratio,
                         rtk->sol.chi2testvalue,rr_normal);
     }
 #endif
 #ifdef ENABLE_RTK_INTEGRITY
-	if (!rtk->int_child) {
-		rtkim_detect(rtk, obs, n, nav, stalin);
-		if (rtk->int_reproc<=0&&rtk->opt.enable_rtk_integrity_fde_recovery&&
+	if (!rtk->intchild) {
+		rtkimdetect(rtk, obs, n, nav, stalin);
+		if (rtk->intreproc<=0&&rtk->opt.intfde&&
 			rtk->intg.fde.act!=RTKIM_A_NONE) {
 			obsd_t obs_fde[MAXOBS*2];
 			prcopt_t opt_save=rtk->opt;
-			int fde_pre_mode=rtk->int_fde_mode;
-			int fde_pre_sat=rtk->int_fde_sat;
+			int fde_pre_mode=rtk->intfdemode;
+			int fde_pre_sat=rtk->intfdesat;
 			int fde_mode=rtk->intg.fde.act;
 			int fde_sat=rtk->intg.fde.sat;
 			int fde_action=fde_mode;
 			int m=0;
-            double rr_before[3]={rtk->sol.rr[0],rtk->sol.rr[1],rtk->sol.rr[2]};
-            int stat_before=rtk->sol.stat;
-            int ns_before=rtk->sol.ns;
-            float ratio_before=rtk->sol.ratio;
-            double ftest_before=rtk->sol.chi2testvalue;
+            double rr0[3]={rtk->sol.rr[0],rtk->sol.rr[1],rtk->sol.rr[2]};
+            int stat0=rtk->sol.stat;
+            int ns0=rtk->sol.ns;
+            float ratio0=rtk->sol.ratio;
+            double test0=rtk->sol.chi2testvalue;
 #if ENABLE_RTK_DEBUG_OUTPUT
-            rtk_debug_epoch(rtk,"before",fde_action,fde_sat,n,n,
-                            stat_before,ns_before,ratio_before,ftest_before,rr_before);
-            rtk_debug_epoch(rtk,"redo_trigger",fde_action,fde_sat,n,n,
-                            stat_before,ns_before,ratio_before,ftest_before,rr_before);
+            rtkdbgepoch(rtk,"before",fde_action,fde_sat,n,n,
+                            stat0,ns0,ratio0,test0,rr0);
+            rtkdbgepoch(rtk,"redo_trigger",fde_action,fde_sat,n,n,
+                            stat0,ns0,ratio0,test0,rr0);
 #endif
 			for (i=0;i<n;i++) {
 				if (fde_mode==RTKIM_A_SAT&&obs[i].sat==fde_sat) continue;
@@ -3773,37 +3868,37 @@ extern int rtkpos(rtk_t* rtk, const obsd_t* obs, int n, const nav_t* nav, const 
                   "fde redo before: time=%s action=%d sat=%d pre_mode=%d pre_sat=%d "
                   "stat=%d ns=%d ratio=%.3f ftest=%.4f rr=%.4f %.4f %.4f kept_obs=%d/%d\n",
                   time_str(rtk->sol.time,3),fde_mode,fde_sat,fde_pre_mode,fde_pre_sat,
-                  stat_before,ns_before,ratio_before,ftest_before,
-                  rr_before[0],rr_before[1],rr_before[2],m,n);
+                  stat0,ns0,ratio0,test0,
+                  rr0[0],rr0[1],rr0[2],m,n);
 			if (fde_mode==RTKIM_A_FLOAT) opt_save.modear=ARMODE_OFF;
 			rtkfree(rtk);
 			rtkinit(rtk,&opt_save);
-			rtk->int_reproc=1;
-			rtk->int_fde_pre_mode=fde_pre_mode;
-			rtk->int_fde_pre_sat=fde_pre_sat;
-			rtk->int_fde_action=fde_action;
+			rtk->intreproc=1;
+			rtk->intfdemode0=fde_pre_mode;
+			rtk->intfdesat0=fde_pre_sat;
+			rtk->intfdeact=fde_action;
 			rtkpos(rtk,obs_fde,m,nav,stalin);
 #if ENABLE_RTK_DEBUG_OUTPUT
-            rtk_debug_epoch(rtk,"after",fde_action,fde_sat,m,n,
-                            stat_before,ns_before,ratio_before,ftest_before,rr_before);
-            rtk_debug_epoch(rtk,"redo_result",fde_action,fde_sat,m,n,
-                            stat_before,ns_before,ratio_before,ftest_before,rr_before);
+            rtkdbgepoch(rtk,"after",fde_action,fde_sat,m,n,
+                            stat0,ns0,ratio0,test0,rr0);
+            rtkdbgepoch(rtk,"redo_result",fde_action,fde_sat,m,n,
+                            stat0,ns0,ratio0,test0,rr0);
 #endif
             trace(3,
                   "fde redo after : time=%s action=%d sat=%d stat=%d ns=%d ratio=%.3f "
                   "ftest=%.4f rr=%.4f %.4f %.4f drr=%.4f %.4f %.4f\n",
                   time_str(rtk->sol.time,3),fde_action,fde_sat,rtk->sol.stat,rtk->sol.ns,
                   rtk->sol.ratio,rtk->sol.chi2testvalue,rtk->sol.rr[0],rtk->sol.rr[1],rtk->sol.rr[2],
-                  rtk->sol.rr[0]-rr_before[0],rtk->sol.rr[1]-rr_before[1],rtk->sol.rr[2]-rr_before[2]);
-			rtk->int_reproc=0;
+                  rtk->sol.rr[0]-rr0[0],rtk->sol.rr[1]-rr0[1],rtk->sol.rr[2]-rr0[2]);
+			rtk->intreproc=0;
 		}
 		else {
-			rtkim_assess(rtk);
+			rtkimassess(rtk);
 		}
 	}
 #endif
-	rtk->sol.rms_pr = (float)residual_rms(rtk, 0, NULL);
-	rtk->sol.rms_cp = (float)residual_rms(rtk, 1, NULL);
+	rtk->sol.rms_pr = (float)resrms(rtk, 0, NULL);
+	rtk->sol.rms_cp = (float)resrms(rtk, 1, NULL);
 	outsolstat(rtk, nav);
 
 	return 1;

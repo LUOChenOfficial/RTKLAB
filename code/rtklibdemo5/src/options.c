@@ -115,18 +115,18 @@ EXPORT opt_t sysopts[]={
     {"pos2-baselen",    1,  (void *)&prcopt_.baseline[0],"m"    },
     {"pos2-basesig",    1,  (void *)&prcopt_.baseline[1],"m"    },
 #ifdef ENABLE_RTK_INTEGRITY
-    {"rtkint-enable",       0, (void *)&prcopt_.enable_rtk_integrity_monitor,          ""},
-    {"rtkint-rbias-export", 0, (void *)&prcopt_.enable_rtk_integrity_rbias_export,     ""},
-    {"rtkint-single-sat",   0, (void *)&prcopt_.enable_monitor_single_satellite_fault, ""},
-    {"rtkint-fixed-update", 0, (void *)&prcopt_.enable_monitor_fixed_ambiguity_update_fault, ""},
-    {"rtkint-fde-recovery", 0, (void *)&prcopt_.enable_rtk_integrity_fde_recovery,     ""},
-    {"rtkint-max-subsets",  0, (void *)&prcopt_.rtk_integrity_max_subset_filters,      ""},
-    {"rtkint-subdiag",      0, (void *)&prcopt_.enable_rtk_integrity_subset_debug_output, ""},
-    {"rtkint-debug-subset", 0, (void *)&prcopt_.rtk_integrity_debug_subset_id,         ""},
-    {"rtkint-debug-sat",    0, (void *)&prcopt_.rtk_integrity_debug_satellite,         ""},
-    {"rtkint-debug-pl",     1, (void *)&prcopt_.rtk_integrity_debug_pl_threshold,      "m"},
-    {"rtkint-pfa",          1, (void *)&prcopt_.rtk_integrity_false_alarm_prob,        ""},
-    {"rtkint-pmd",          1, (void *)&prcopt_.rtk_integrity_miss_detect_prob,        ""},
+    {"rtkint-enable",       0, (void *)&prcopt_.intmon,          ""},
+    {"rtkint-rbias-export", 0, (void *)&prcopt_.intoutbias,     ""},
+    {"rtkint-single-sat",   0, (void *)&prcopt_.intsat, ""},
+    {"rtkint-fixed-update", 0, (void *)&prcopt_.intamb, ""},
+    {"rtkint-fde-recovery", 0, (void *)&prcopt_.intfde,     ""},
+    {"rtkint-max-subsets",  0, (void *)&prcopt_.maxintsub,      ""},
+    {"rtkint-subdiag",      0, (void *)&prcopt_.intoutsub, ""},
+    {"rtkint-debug-subset", 0, (void *)&prcopt_.intdbgid,         ""},
+    {"rtkint-debug-sat",    0, (void *)&prcopt_.intdbgsat,         ""},
+    {"rtkint-debug-pl",     1, (void *)&prcopt_.intdbgpl,      "m"},
+    {"rtkint-pfa",          1, (void *)&prcopt_.intpfa,        ""},
+    {"rtkint-pmd",          1, (void *)&prcopt_.intpmd,        ""},
 #endif
     
     {"out-solformat",   3,  (void *)&solopt_.posf,       SOLOPT },
@@ -515,18 +515,18 @@ extern void resetsysopts(void)
     prcopt_=prcopt_default;
     solopt_=solopt_default;
 #ifdef ENABLE_RTK_INTEGRITY
-    prcopt_.enable_rtk_integrity_monitor=0;
-    prcopt_.enable_rtk_integrity_rbias_export=0;
-    prcopt_.enable_monitor_single_satellite_fault=1;
-    prcopt_.enable_monitor_fixed_ambiguity_update_fault=1;
-    prcopt_.enable_rtk_integrity_fde_recovery=1;
-    prcopt_.rtk_integrity_max_subset_filters=12;
-    prcopt_.enable_rtk_integrity_subset_debug_output=0;
-    prcopt_.rtk_integrity_debug_subset_id=0;
-    prcopt_.rtk_integrity_debug_satellite=0;
-    prcopt_.rtk_integrity_debug_pl_threshold=0.0;
-    prcopt_.rtk_integrity_false_alarm_prob=1e-6;
-    prcopt_.rtk_integrity_miss_detect_prob=5e-8;
+    prcopt_.intmon=0;
+    prcopt_.intoutbias=0;
+    prcopt_.intsat=1;
+    prcopt_.intamb=1;
+    prcopt_.intfde=1;
+    prcopt_.maxintsub=12;
+    prcopt_.intoutsub=0;
+    prcopt_.intdbgid=0;
+    prcopt_.intdbgsat=0;
+    prcopt_.intdbgpl=0.0;
+    prcopt_.intpfa=1e-6;
+    prcopt_.intpmd=5e-8;
 #endif
     filopt_.satantp[0]='\0';
     filopt_.rcvantp[0]='\0';

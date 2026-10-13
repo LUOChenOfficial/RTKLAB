@@ -21,6 +21,9 @@
     <ClCompile Include="src\convgpx.c">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="src\rtk_gls.c">
+      <Filter>源文件</Filter>
+    </ClCompile>
     <ClCompile Include="src\convkml.c">
       <Filter>源文件</Filter>
     </ClCompile>
@@ -93,8 +96,23 @@
     <ClCompile Include="src\rtkcmn.c">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="src\rtk_debug.c">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\rtk_int_common.c">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\rtk_int_config.c">
+      <Filter>源文件</Filter>
+    </ClCompile>
     <ClCompile Include="src\rtk_int.c">
-      <Filter>婧愭枃浠?/Filter>
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ransac.c">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\rtk_slope.c">
+      <Filter>源文件</Filter>
     </ClCompile>
 <ClCompile Include="src\rtkpos.c">
       <Filter>源文件</Filter>
@@ -170,8 +188,14 @@
     </ClCompile>
 </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="src\rtk_experiment_config.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\rtk_int_internal.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
     <ClInclude Include="src\rtk_int.h">
-      <Filter>澶存枃浠?/Filter>
+      <Filter>头文件</Filter>
     </ClInclude>
     <ClInclude Include="src\rtklib.h">
       <Filter>头文件</Filter>

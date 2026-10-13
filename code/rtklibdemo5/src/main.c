@@ -97,6 +97,9 @@ int main(int argc,char **argv)
     if (!strcmp(env, "Static")) {
         strcpy(obs_ext, ".25O"); strcpy(nav_ext, ".25P");
     }
+    else if (!strcmp(env, "JC01") || !strcmp(env, "JC02") || !strcmp(env, "JC04")) {
+        strcpy(obs_ext, ".24O"); strcpy(nav_ext, ".24P");
+    }
     else {
         strcpy(obs_ext, ".21o"); strcpy(nav_ext, ".21p");
     }
@@ -118,6 +121,7 @@ int main(int argc,char **argv)
     strcpy(outfile, resultpath);
     strcat(outfile, str_envir);
     strcat(outfile, "test_ambfix.pos");
+    if (argc > 2) snprintf(outfile, sizeof(outfile), "%s", argv[2]);
 
     //openmodel(strcat(str[4], "model_weight.txt"));
 
@@ -155,25 +159,7 @@ int main(int argc,char **argv)
     prcopt.dynamics = 0;
     
 #ifdef ENABLE_RTK_INTEGRITY
-    /* Integrity master switches */
-    prcopt.enable_rtk_integrity_monitor = 0;
-    prcopt.enable_rtk_integrity_rbias_export = 0;
-
-    /* Monitored fault modes */
-    prcopt.enable_monitor_single_satellite_fault = 1;
-    prcopt.enable_monitor_fixed_ambiguity_update_fault = 1;
-
-    /* Recovery / subset control */
-    prcopt.enable_rtk_integrity_fde_recovery = 1;
-    prcopt.rtk_integrity_max_subset_filters = 32;
-
-    /* Integrity debug output */
-    prcopt.enable_rtk_integrity_subset_debug_output = 0;
-    prcopt.rtk_integrity_debug_subset_id = 0;
-    prcopt.rtk_integrity_debug_satellite = 0;
-    prcopt.rtk_integrity_debug_pl_threshold = 0.0;
-    prcopt.rtk_integrity_false_alarm_prob = 1e-4;
-    prcopt.rtk_integrity_miss_detect_prob = 1e-3;
+    rtkimcfg(&prcopt);
 #endif
 #if ENABLE_RTK_SKIP_EPOCH
     prcopt.rtk_skip_epoch_time[0] = 2021;

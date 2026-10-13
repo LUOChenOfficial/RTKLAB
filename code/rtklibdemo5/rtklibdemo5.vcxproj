@@ -73,6 +73,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\main.c" />
+    <ClCompile Include="src\rtk_gls.c" />
 <ClCompile Include="src\convgpx.c" />
     <ClCompile Include="src\convkml.c" />
     <ClCompile Include="src\convrnx.c" />
@@ -113,7 +114,12 @@
     <ClCompile Include="src\rtcm3.c" />
     <ClCompile Include="src\rtcm3e.c" />
     <ClCompile Include="src\rtkcmn.c" />
+    <ClCompile Include="src\rtk_debug.c" />
+    <ClCompile Include="src\rtk_int_common.c" />
+    <ClCompile Include="src\rtk_int_config.c" />
     <ClCompile Include="src\rtk_int.c" />
+    <ClCompile Include="src\ransac.c" />
+    <ClCompile Include="src\rtk_slope.c" />
 <ClCompile Include="src\rtkpos.c" />
     <ClCompile Include="src\rtksvr.c" />
     <ClCompile Include="src\sbas.c" />
@@ -124,6 +130,8 @@
     <ClCompile Include="src\tle.c" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="src\rtk_experiment_config.h" />
+    <ClInclude Include="src\rtk_int_internal.h" />
     <ClInclude Include="src\rtk_int.h" />
     <ClInclude Include="src\rtklib.h" />
   </ItemGroup>
