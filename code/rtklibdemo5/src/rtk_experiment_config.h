@@ -10,6 +10,33 @@
 #define RTK_INT_METHOD_LS_SS     1
 #define RTK_INT_METHOD_SLOPE     2
 #define RTK_INT_METHOD_GLS_SS    3
+#ifndef RTK_GLS_POST_SCALE
+#define RTK_GLS_POST_SCALE 1 /* epoch common-scale covariance reporting */
+#endif
+#ifndef RTK_GLS_PFA
+#define RTK_GLS_PFA 1e-4 /* total experimental deformation-monitoring budget */
+#endif
+#ifndef RTK_GLS_PMD
+#define RTK_GLS_PMD 1e-3 /* total budget before mode/axis allocation */
+#endif
+#ifndef RTK_GLS_MAX_FAULTS
+#define RTK_GLS_MAX_FAULTS 2 /* maximum simultaneous satellite faults */
+#endif
+#ifndef RTK_GLS_FDE
+#define RTK_GLS_FDE 1 /* verified recovery; override with 0 for PL-only runs */
+#endif
+#ifndef RTK_GLS_FDE_FLOAT_FIRST
+#define RTK_GLS_FDE_FLOAT_FIRST 1 /* fixed-related alarm is not satellite isolation */
+#endif
+#ifndef RTK_GLS_FDE_TRANSACTIONAL
+#define RTK_GLS_FDE_TRANSACTIONAL 1 /* discard failed candidate estimator history */
+#endif
+#ifndef RTK_GLS_FDE_SEARCH
+#define RTK_GLS_FDE_SEARCH 1 /* verify single then double satellite candidates */
+#endif
+#if RTK_GLS_MAX_FAULTS < 1 || RTK_GLS_MAX_FAULTS > 8
+#error RTK_GLS_MAX_FAULTS must be between 1 and 8
+#endif
 /* Experimental combinations: change the master switch, then rebuild. */
 #ifndef ENABLE_RTK_RANSAC_ARAIM
 #define ENABLE_RTK_RANSAC_ARAIM 0 /* screened single KF + current-epoch GLS subsets */
@@ -72,6 +99,18 @@
 #endif
 #ifndef RTK_RANSAC_PROBABILITY
 #define RTK_RANSAC_PROBABILITY 0.99
+#endif
+#ifndef ENABLE_RTK_ROBUST_ITERATION
+#define ENABLE_RTK_ROBUST_ITERATION 0 /* JC paired trial: retain single-pass default */
+#endif
+#ifndef RTK_ROBUST_MAX_ITER
+#define RTK_ROBUST_MAX_ITER 20
+#endif
+#ifndef RTK_ROBUST_WEIGHT_TOL
+#define RTK_ROBUST_WEIGHT_TOL 1E-3 /* maximum absolute log-weight change */
+#endif
+#ifndef RTK_ROBUST_RELAXATION
+#define RTK_ROBUST_RELAXATION 0.5 /* log-weight relaxation after the first pass */
 #endif
 #ifndef ENABLE_BDS_NEW_DATA
 #define ENABLE_BDS_NEW_DATA 0 /* 1: BDS-3-reorganized data */

@@ -73,6 +73,11 @@ typedef struct {
 } rtkim_fde_t;
 
 typedef struct {
+    int order,sat[2]; /* recovery search is limited to single/double faults */
+    double score;    /* float-full to float-subset score: ordering only */
+} rtkim_glscand_t;
+
+typedef struct {
     int ena,init;
     int ndef,nact;
     rtkim_def_t def[MAXSAT+1];
@@ -95,6 +100,9 @@ typedef struct {
     int glsgeofail,glssolfail,glscovfail;
     int glsobsalert,glsfixalert;
     double glsobsratio,glsfixratio;
+    double glsfloatratio; /* independent of fixed-to-subset joint alarms */
+    rtkim_glscand_t *glscandidates; /* owned scratch; never a fault declaration */
+    int glsncandidate,glscapacity;
 } rtkim_t;
 
 #endif

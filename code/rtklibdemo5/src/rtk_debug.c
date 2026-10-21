@@ -35,6 +35,22 @@ void rtkimdbg(const char *format, ...)
 #endif
 }
 
+EXPORT void rtkdbgrobust(gtime_t time, int nv, int iterations, double change,
+                        int status, const char *reason)
+{
+    rtkimdbg("IGG3_ITER %s %d %d %.9g %d %s\n",time_str(time,3),nv,
+             iterations,change,status,reason);
+}
+
+EXPORT void rtkdbgweight(gtime_t time,int row,int flag,double weight)
+{
+    char ref[16],sat[16];
+    satno2id((flag>>16)&255,ref);
+    satno2id((flag>>8)&255,sat);
+    rtkimdbg("IGG3_WEIGHT %s %d %s %s %d %d %.17g\n",
+             time_str(time,3),row,ref,sat,(flag>>4)&15,(flag&15)+1,weight);
+}
+
 EXPORT int rtkdbgopen(const char *outfile)
 {
 #if ENABLE_RTK_DEBUG_OUTPUT
@@ -53,6 +69,8 @@ EXPORT int rtkdbgopen(const char *outfile)
         fprintf(fp_rtkdbg,"%% SATSET time stage count sat_list\n");
         fprintf(fp_rtkdbg,"%% RANSAC_SD time sat freq model_dim obs_count "
                            "consensus_count keep sd_m variance_m2\n");
+        fprintf(fp_rtkdbg,"%% IGG3_ITER time nv iterations max_log_weight_change "
+                           "status reason\n");
         fprintf(fp_rtkdbg,
                 "%% SLOPE_KF time available nv fault_modes statistic "
                 "threshold noncentrality h_slope v_slope HPL VPL\n");

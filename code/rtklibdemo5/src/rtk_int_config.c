@@ -45,10 +45,10 @@ EXPORT void rtkimcfg(prcopt_t *opt)
     /* GLS streams single/double satellite and wrong-integer hypotheses.
      * FILTER_SS remains available explicitly for the parallel-filter baseline. */
     opt->intamb=RTK_INT_METHOD==RTK_INT_METHOD_GLS_SS;
-    opt->intfde=0;
+    opt->intfde=RTK_INT_METHOD==RTK_INT_METHOD_GLS_SS?RTK_GLS_FDE:0;
     opt->maxintsub=MAXSAT+1;
-    opt->intpfa=1e-6;
-    opt->intpmd=5e-8;
+    opt->intpfa=RTK_GLS_PFA;
+    opt->intpmd=RTK_GLS_PMD;
 #endif
 }
 #endif

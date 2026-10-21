@@ -7,7 +7,9 @@ int main(void)
     const int nx=5,nv=5;
     double x[5]={-2186035.8,5181367.8,2999261.2,2.0,0.0};
     double P[25]={0},H[25]={0},R[25]={0},v[5]={.1,-.2,.15,.05,-.1};
-    double directions[15]={1,0,0,0,1,0,0,0,1,1,1,0,0,1,1};
+    /* Moment-curve geometry: every four satellites (including the reference
+     * at the origin) are affinely independent, so all double deletions work. */
+    double directions[15]={1,1,1,2,4,8,3,9,27,4,16,64,5,25,125};
     int flags[5],rows[5],ixref[5],nr,i,j,k,a,b,checks=0;
     rtk_t *rtk=(rtk_t *)calloc(1,sizeof(rtk_t));
     if (!rtk) return 2;
@@ -27,6 +29,31 @@ int main(void)
     rtkimsaveddr(rtk,H,R,v,flags,nx,nv);
     rtkimglsprior(rtk,x,P,H,R,nx,nv);
     if (!rtk->intg.glsready) return 3;
+    {
+        double xs[5],ps[25],rs[25],res[5],corr[5],qi[25],ri[25],J,Jaug=0.0;
+        double S[4]={2.0,.5,.5,1.0},v2[2]={1,2},expected=7.0/1.75;
+        if (!rtkglsvarscale(S,v2,2,&J)||fabs(J-expected)>1e-12) return 38;
+        if (rtkglsvarscale(S,v2,0,&J)) return 39;
+        S[3]=-1;if (rtkglsvarscale(S,v2,2,&J)) return 40;
+        matcpy(xs,x,nx,1);matcpy(ps,P,nx,nx);matcpy(rs,R,nv,nv);
+        if (filter(xs,ps,H,v,rs,nx,nv,rtk)) return 41;
+        for (i=0;i<nv;i++) {
+            res[i]=v[i];for (j=0;j<nx;j++) res[i]-=H[j+i*nx]*(xs[j]-x[j]);
+        }
+        /* Independent real residual + prior correction quadratic. Active
+         * state block 0..3; dormant state 4 is not an estimated parameter. */
+        for (i=0;i<4;i++) {
+            corr[i]=xs[i]-x[i];for (j=0;j<4;j++) qi[i+j*4]=P[i+j*nx];
+        }
+        matcpy(ri,R,nv,nv);
+        if (matinv(qi,4)||matinv(ri,nv)) return 42;
+        for (i=0;i<nv;i++) for (j=0;j<nv;j++) Jaug+=res[i]*ri[i+j*nv]*res[j];
+        for (i=0;i<4;i++) for (j=0;j<4;j++) Jaug+=corr[i]*qi[i+j*4]*corr[j];
+        if (!rtkglsvarscale(rtk->intg.glsQ,v,nv,&J)||fabs(J-Jaug)>1e-8) return 43;
+        if (fabs(rtk->sol.post_varfactor-J/nv)>1e-10) return 44;
+    }
+    /* Kernel baseline comparisons below use unscaled model covariance. */
+    rtk->sol.post_varfactor=1.0;
     for (a=0;a<=6;a++) for (b=a;b<=6;b++) {
         double pos[3],cov[9],xs[5],ps[25],hs[25],rs[25],vs[5];
         if (a==0 && b!=0) continue;
@@ -52,20 +79,84 @@ int main(void)
         }
         checks++;
     }
+    /* Multi-satellite exclusions: compare sparse DD transform to a direct KF,
+     * including deletion of the reference and of multiple candidate anchors. */
+    for (a=1;a<=6;a++) for (b=a+1;b<=6;b++) for (k=b+1;k<=6;k++) {
+        unsigned char mask[MAXSAT]={0};
+        double pos[3],cov[9],xs[5],ps[25],hs[25],rs[25],vs[5];
+        int l;
+        mask[a-1]=mask[b-1]=mask[k-1]=1;
+        nr=rtkglsddmask(flags,nv,mask,rows,ixref);
+        if (!nr) continue;
+        matcpy(xs,x,nx,1);matcpy(ps,P,nx,nx);
+        for (i=0;i<nr;i++) {
+            int r=rows[i],anchor=ixref[i];
+            if (mask[((flags[r]>>8)&255)-1]) return 30;
+            if (anchor>=0&&mask[((flags[anchor]>>8)&255)-1]) return 31;
+            vs[i]=v[r]-(anchor>=0?v[anchor]:0.0);
+            for (l=0;l<nx;l++) hs[l+i*nx]=H[l+r*nx]-(anchor>=0?H[l+anchor*nx]:0.0);
+            for (j=0;j<nr;j++) {
+                int s=rows[j],other=ixref[j];
+                rs[i+j*nr]=R[r+s*nv]-(anchor>=0?R[anchor+s*nv]:0.0)
+                    -(other>=0?R[r+other*nv]:0.0)+(anchor>=0&&other>=0?R[anchor+other*nv]:0.0);
+            }
+        }
+        if (filter(xs,ps,hs,vs,rs,nx,nr,rtk)) return 32;
+        if (!rtkglsupdate(rtk->intg.glsQ,rtk->intg.glsF,v,x,rtk->intg.glscov,nv,rows,ixref,nr,pos,cov)) return 33;
+        for (i=0;i<3;i++) {
+            if (fabs(xs[i]-pos[i])>1e-8) return 34;
+            for (j=0;j<3;j++) if (fabs(ps[i+j*nx]-cov[i+j*3])>1e-8) return 35;
+        }
+        checks++;
+    }
     /* Explicit reference cancellation: all retained rows must use anchor C02. */
     nr=rtkglsddmat(flags,nv,1,3,rows,ixref);
     if (nr!=3) return 9;
     for (i=0;i<nr;i++) if (ixref[i]!=0 || rows[i]==1) return 10;
-    /* Fixed output deliberately differs by 100 m: actual separation enters PL. */
+    /* PL uses modeled separation uncertainty; changing only the realized
+     * fixed-to-float displacement must not change the candidate envelope. */
     {
         double pos[3],cov[9],Pa[9]={0};
         nr=rtkglsddmat(flags,nv,0,0,rows,ixref);
         if (!rtkglsupdate(rtk->intg.glsQ,rtk->intg.glsF,v,x,rtk->intg.glscov,nv,rows,ixref,nr,pos,cov)) return 11;
         rtk->x=pos;rtk->Pa=Pa;rtk->sol.stat=SOLQ_FIX;
         for (i=0;i<3;i++) {rtk->sol.rr[i]=pos[i];Pa[i+i*3]=1e-5;}
+        rtkimglsassess(rtk);
+        {
+            double hpl0=rtk->intg.pl.hpl0,vpl0=rtk->intg.pl.vpl0;
+            if (!(hpl0>0.0&&vpl0>0.0)||rtk->intg.pl.hsss[0]<=0.0) return 36;
+            rtk->sol.rr[0]+=1e-3;
+            rtkimglsassess(rtk);
+            if (fabs(rtk->intg.pl.hpl0-hpl0)>1e-7 ||
+                fabs(rtk->intg.pl.vpl0-vpl0)>1e-7) return 37;
+            rtk->sol.rr[0]=pos[0];
+            rtk->sol.post_varfactor=4.0;
+            rtkimglsassess(rtk);
+            if (fabs(rtk->intg.pl.hpl0-2*hpl0)>1e-7||
+                fabs(rtk->intg.pl.vpl0-2*vpl0)>1e-7) return 45;
+            rtk->sol.post_varfactor=1.0;
+        }
+        /* A large displacement still fails detection and invalidates PL. */
         rtk->sol.rr[0]+=100.0;
+        rtk->opt.intfde=1;
         rtkimglsassess(rtk);
         if (rtk->intg.glsexp!=43 || !rtk->intg.glsalert || !isinf(rtk->inthpl)) return 12;
+        /* An arbitrary fixed displacement must not become a satellite
+         * declaration when the float-full/subset tests still pass. */
+        if (RTK_GLS_FDE_FLOAT_FIRST&&rtk->intg.glsfloatratio<=1.0&&
+            rtk->intg.glsvalid==rtk->intg.glsexp&&
+            rtk->intg.fde.act!=RTKIM_A_FLOAT) return 46;
+        if (RTK_GLS_FDE_SEARCH&&rtk->intg.glsncandidate!=21) {
+            printf("FDE fixture: candidates=%d valid=%d expected=%d float=%.6g act=%d\n",
+                   rtk->intg.glsncandidate,rtk->intg.glsvalid,rtk->intg.glsexp,
+                   rtk->intg.glsfloatratio,rtk->intg.fde.act);
+            return 47;
+        }
+        if (RTK_GLS_FDE_SEARCH) for (i=0;i<rtk->intg.glsncandidate;i++) {
+            const rtkim_glscand_t *c=rtk->intg.glscandidates+i;
+            if (c->order<1||c->order>2||c->sat[0]<1||
+                (c->order==2&&(!c->sat[1]||c->sat[0]==c->sat[1]))) return 48;
+        }
         rtk->opt.intamb=0;
         rtkimglsassess(rtk);
         if (!isinf(rtk->inthpl)) return 13;
@@ -74,6 +165,6 @@ int main(void)
         if (!isinf(rtk->intvpl)) return 14;
     }
     rtkimfree(rtk);free(rtk);
-    printf("PASS: %d GLS/KF subset comparisons, DD reference cancellation, wrong-fixed alarm, missing-model unavailable\n",checks);
+    printf("PASS: %d GLS/KF subset comparisons, augmented residual scale identity, scaled PL, DD reference cancellation, threshold PL displacement invariance, wrong-fixed alarm, missing-model unavailable\n",checks);
     return 0;
 }

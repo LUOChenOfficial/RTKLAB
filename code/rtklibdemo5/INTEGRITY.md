@@ -10,6 +10,7 @@
 | `src/rtk_gls.c` | 当前历元 GLS 解分离及故障模式评估 |
 | `src/rtk_slope.c` | 斜率法统计阈值、先验捕获及保护水平计算 |
 | `src/ransac.c` | 载波单差一致集选择内核 |
+| `src/rtk_robust.c` | 固定先验的 IGGIII 权值迭代与等效观测协方差 |
 | `src/rtk_debug.c` | 调试文件、观测与模糊度诊断、在线蒙特卡洛 |
 | `src/rtk_int_common.c` | 共用概率阈值与坐标工具 |
 | `src/rtk_int_internal.h` | 监测模块内部接口；不增加到公共 `rtklib.h` |

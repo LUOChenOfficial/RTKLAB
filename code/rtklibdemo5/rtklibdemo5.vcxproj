@@ -119,6 +119,7 @@
     <ClCompile Include="src\rtk_int_config.c" />
     <ClCompile Include="src\rtk_int.c" />
     <ClCompile Include="src\ransac.c" />
+    <ClCompile Include="src\rtk_robust.c" />
     <ClCompile Include="src\rtk_slope.c" />
 <ClCompile Include="src\rtkpos.c" />
     <ClCompile Include="src\rtksvr.c" />

@@ -43,6 +43,7 @@
 *           2018/12/15 1.14 disable ambiguity resolution for gps-qzss
 *-----------------------------------------------------------------------------*/
 #include <stdarg.h>
+#include "rtk_int_internal.h"
 #include "rtklib.h"
 
 const int IGSO[] = { 6,7,8,9,10,13,16,38,39,40 };
@@ -2043,76 +2044,26 @@ static int ddres(rtk_t* rtk, const nav_t* nav, const obsd_t* obs, double dt, con
 }
 
 
-/* 新，抗差卡尔曼滤波,无需二次滤波[面向大众导航的低成本接收机高精度定位算法]-------*/
+/* IGGIII reweighting with a fixed state prior --------------------------------*/
 static int robust_KF2(rtk_t* rtk, const double* x, const double* P, const double* v,
 	const double* H, double* R, int nx, int nv)
 {
-	double* vk, * P_, * R_, * Q_vk, * Q_vkk, * HP, * RQ, * H_, * Gamma;
-	double vi, k0 = 2.0/*2.0-3.0*/, k1 = 8.5/*4.5-8.5*/, gamma = 1.0, gamma_i = 1.0, gamma_j = 1.0;
-	int i, j, n = nx, info = 1, * ix;
-
-	ix = imat(nx, 1);
-	for (i = n = 0; i < nx; i++) {
-		if (x[i] != 0.0 && P[i + i * nx] > 0.0)
-			ix[n++] = i;
-	}
-
-	vk = mat(nv, 1);  P_ = mat(n, n);      HP = mat(nv, n);  Q_vk = mat(nv, nv);
-	R_ = mat(nv, nv); Q_vkk = mat(nv, nv); RQ = mat(nv, nv); Gamma = mat(nv, 1);
-	H_ = mat(n, nv);
-
-	for (i = 0; i < n; i++) {
-		for (j = 0; j < n; j++) P_[i + j * n] = P[ix[i] + ix[j] * nx];
-		for (j = 0; j < nv; j++) H_[i + j * n] = H[ix[i] + j * nx];
-	}
-
-	/*matcpy(P_,P,n,n); */
-	matcpy(Q_vk, R, nv, nv);   matcpy(R_, R, nv, nv);
-	matmul("TN", nv, n, n, 1.0, H_, P_, 0.0, HP);    /* HP=HT*P */
-	matmul("NN", nv, nv, n, 1.0, HP, H_, 1.0, Q_vk); /* Q=R+HT*P*H */
-
-	if (!(info = matinv(Q_vk, nv))) {
-		matmul("NN", nv, nv, nv, 1.0, R_, Q_vk, 0.0, RQ);  /* RQ=R*Q^-1 */
-		matmul("NN", nv, 1, nv, 1.0, RQ, v, 0.0, vk);      /* vk=R*Q^-1*v */
-		matmul("NT", nv, nv, nv, 1.0, RQ, R_, 0.0, Q_vkk); /* Q_=R*Q^-1*RT */
-	}
-
-	for (i = 0; i < nv; i++) {
-		//20240321 by qq
-		vi = fabs(vk[i]) / SQRT(Q_vkk[i * nv + i]);
-		/*IGG3*/
-		if (vi < k0)
-		{
-			gamma = 1.0;
-		}
-		else if (vi > k1)
-		{
-			gamma = 1E-6;
-			printf("del----\r\n");
-		}
-		else
-		{
-			gamma = k0 / vi * pow((k1 - vi) / (k1 - k0), 2);
-			printf("down----\r\n");
-		}
-		Gamma[i] = gamma;
-		//R[i*nv+i]=R[i*nv+i]/gamma;
-	}
-	/* 调整方差及协方差[BDS/GPS组合动态相对定位及其质量控制方法研究] */
-	for (i = 0; i < nv; i++) {
-		gamma_i = Gamma[i];
-		for (j = 0; j < nv; j++) {
-			gamma_j = Gamma[j];
-			gamma = SQRT(gamma_i * gamma_j);
-			R[i * nv + j] = R[i * nv + j] / gamma;
-		}
-	}
-
-	free(vk); free(P_); free(Q_vk); free(Gamma);
-	free(RQ); free(Q_vkk); free(HP); free(R_);
-	free(ix); free(H_);
-
-	return info; /* 0:ok */
+    int iterations=0,maxiter=ENABLE_RTK_ROBUST_ITERATION?RTK_ROBUST_MAX_ITER:1;
+    double change=0.0;
+    int info=rtkrobust(x,P,v,H,R,nx,nv,maxiter,RTK_ROBUST_WEIGHT_TOL,
+                      RTK_ROBUST_RELAXATION,&iterations,&change);
+    const char *reason=info<0?"numerical":maxiter==1?"single":
+                       info==1?"maxiter":"converged";
+    rtkdbgrobust(rtk->sol.time,nv,iterations,change,info,reason);
+    /* Diagnostic only: Rw_ii=R0_ii/gamma_i. Report final row weights,
+     * including unchanged rows, against the saved pre-robust DD model. */
+    if (info>=0&&rtk->intg.bnv==nv&&rtk->intg.bR) {
+        int row;
+        for (row=0;row<nv;row++)
+            rtkdbgweight(rtk->sol.time,row,rtk->intg.bflg[row],
+                         rtk->intg.bR[row+row*nv]/R[row+row*nv]);
+    }
+    return info;
 }
 
 
@@ -3232,6 +3183,9 @@ static int relpos(rtk_t* rtk, const obsd_t* obs, int nu, int nr,
 #endif
 #if RTK_INT_METHOD==RTK_INT_METHOD_GLS_SS
     rtk->intg.glsready=0;
+    rtk->glsassessed=0;
+    rtk->sol.post_varfactor=1.0;
+    rtk->sol.post_vtpv=0.0;rtk->sol.post_dof=0;
 #endif
 	/* time diff between base and rover observations (usually zero) */
 	dt = timediff(time, obs[nu].time);
@@ -3375,8 +3329,13 @@ static int relpos(rtk_t* rtk, const obsd_t* obs, int nu, int nr,
 				//20240321-byqq
 		matcpy(Pp, rtk->P, rtk->nx, rtk->nx);
 #if Open_Robust
-		if (rtk->nx > 0) { /* robust algorithm after first ar*/
+		if (rtk->nx > 0) {
 			info = robust_KF2(rtk, xp, Pp, v, H, R, rtk->nx, nv);
+            if (info<0) {
+                errmsg(rtk,"IGGIII numerical failure\n");
+                stat=SOLQ_NONE;
+                break;
+            }
 		}
 #endif
 
@@ -3530,6 +3489,12 @@ static int relpos(rtk_t* rtk, const obsd_t* obs, int nu, int nr,
 		rtk->sol.rr_flt[i] = rtk->x[i];
 	}
 
+#if RTK_INT_METHOD==RTK_INT_METHOD_GLS_SS && RTK_GLS_POST_SCALE
+    if (rtk->opt.intmon&&(!rtk->intg.glsready||rtk->sol.post_dof<=0)) {
+        errmsg(rtk,"posterior GLS scale unavailable\n");
+        stat=SOLQ_NONE;
+    }
+#endif
 	/* save solution status (fixed or float) */
 	if (stat == SOLQ_FIX) {
 		for (i = 0; i < 3; i++) {
@@ -3570,6 +3535,18 @@ static int relpos(rtk_t* rtk, const obsd_t* obs, int nu, int nr,
 		}
 		rtk->nfix = 0;
 	}
+#if RTK_INT_METHOD==RTK_INT_METHOD_GLS_SS && RTK_GLS_POST_SCALE
+    if (stat!=SOLQ_NONE&&rtk->opt.intmon) {
+        for (i=0;i<6;i++) {
+            rtk->sol.qr[i]=(float)(rtk->sol.qr[i]*rtk->sol.post_varfactor);
+            if (rtk->opt.dynamics)
+                rtk->sol.qv[i]=(float)(rtk->sol.qv[i]*rtk->sol.post_varfactor);
+        }
+        rtkimdbg("POST_SCALE %s %d %.17g %.17g %.17g\n",
+                 time_str(time,3),rtk->sol.post_dof,rtk->sol.post_vtpv,
+                 rtk->sol.post_varfactor,sqrt(rtk->sol.post_varfactor));
+    }
+#endif
 	if (stat != SOLQ_NONE) rtk->sol.stat = stat;
 	for (i = 0; i < n; i++) for (j = 0; j < nf; j++) {
 		if (obs[i].L[j] == 0.0) continue;
@@ -3722,6 +3699,161 @@ extern void rtkfree(rtk_t* rtk)
 * notes  : before calling function, base station position rtk->sol.rb[] should
 *          be properly set for relative mode except for moving-baseline
 *-----------------------------------------------------------------------------*/
+#if defined(ENABLE_RTK_INTEGRITY) && RTK_INT_METHOD==RTK_INT_METHOD_GLS_SS
+/* Save before relpos: prediction, slip/lock counters and AR must be replayed
+ * once from the same history, not from the rejected full-observation posterior.
+ * The monitor owns mutable scratch allocations, so it is never shallow-restored. */
+static rtk_t *glsfdesave(const rtk_t *rtk)
+{
+    size_t nx=rtk->nx,na=rtk->na;
+    double *values;
+    rtk_t *prior=(rtk_t *)malloc(sizeof(rtk_t));
+    if (!prior) return NULL;
+    values=(double *)malloc((nx+nx*nx+na+na*na)*sizeof(double));
+    if (!values) {free(prior);return NULL;}
+    *prior=*rtk;
+    prior->x=values;
+    prior->P=prior->x+nx;
+    prior->xa=prior->P+nx*nx;
+    prior->Pa=prior->xa+na;
+    matcpy(prior->x,rtk->x,rtk->nx,1);
+    matcpy(prior->P,rtk->P,rtk->nx,rtk->nx);
+    matcpy(prior->xa,rtk->xa,rtk->na,1);
+    matcpy(prior->Pa,rtk->Pa,rtk->na,rtk->na);
+    return prior;
+}
+
+static void glsfderestore(rtk_t *rtk, const rtk_t *prior)
+{
+    rtkim_t monitor=rtk->intg;
+    double *x=rtk->x,*P=rtk->P,*xa=rtk->xa,*Pa=rtk->Pa;
+    *rtk=*prior;
+    rtk->intg=monitor;
+    rtk->x=x;rtk->P=P;rtk->xa=xa;rtk->Pa=Pa;
+    matcpy(x,prior->x,rtk->nx,1);
+    matcpy(P,prior->P,rtk->nx,rtk->nx);
+    matcpy(xa,prior->xa,rtk->na,1);
+    matcpy(Pa,prior->Pa,rtk->na,rtk->na);
+}
+
+static int glsfdecmp(const void *a,const void *b)
+{
+    const rtkim_glscand_t *x=(const rtkim_glscand_t *)a;
+    const rtkim_glscand_t *y=(const rtkim_glscand_t *)b;
+    if (x->order!=y->order) return x->order-y->order;
+    if (x->score!=y->score) return x->score>y->score?-1:1;
+    if (x->sat[0]!=y->sat[0]) return x->sat[0]-y->sat[0];
+    return x->sat[1]-y->sat[1];
+}
+
+/* Only a completed, passing assessment permits committing a trial posterior. */
+static int glsfdepassed(const rtk_t *rtk)
+{
+    return (rtk->sol.stat==SOLQ_FLOAT||rtk->sol.stat==SOLQ_FIX)&&
+        rtk->intg.glsready&&rtk->glsassessed&&rtk->intg.glsexp>0&&
+        rtk->intg.glsvalid==rtk->intg.glsexp&&!rtk->intg.glsalert&&
+        isfinite(rtk->inthpl)&&isfinite(rtk->intvpl);
+}
+
+static int glsfdetrial(rtk_t *rtk,const rtk_t *prior,const obsd_t *obs,int n,
+                     const nav_t *nav,const sta_t *sta,const unsigned char *mask,
+                     int asfloat,int action,int attempt)
+{
+    obsd_t kept[MAXOBS*2];
+    int i,m=0,nu=0,nr=0,modear=prior->opt.modear;
+    glsfderestore(rtk,prior);
+    rtk->intreproc=1;
+    rtk->intfdeact=action;
+    rtk->intfdemode0=asfloat?RTKIM_F_NFIX:RTKIM_F_SAT;
+    rtk->intfdesat0=0;
+    for (i=0;i<MAXSAT;i++) if (mask[i]) {
+        if (!rtk->intfdesat0) rtk->intfdesat0=i+1;
+        rtkimdbg("GLS_FDE_TRY_SAT %s attempt=%d sat=%d\n",
+                 time_str(rtk->sol.time,3),attempt,i+1);
+    }
+    for (i=0;i<n&&m<MAXOBS*2;i++) if (!mask[obs[i].sat-1]) kept[m++]=obs[i];
+    for (;nu<m&&kept[nu].rcv==1;nu++);
+    for (;nu+nr<m&&kept[nu+nr].rcv==2;nr++);
+    if (asfloat) rtk->opt.modear=ARMODE_OFF;
+    if (nu>0&&nr>0) relpos(rtk,kept,nu,nr,nav);
+    else {rtk->sol.stat=SOLQ_NONE;rtk->intg.glsready=0;rtk->glsassessed=0;}
+    rtkimdetect(rtk,kept,m,nav,sta);
+    rtkimassess(rtk);
+    rtk->opt.modear=modear;
+    rtkimdbg("GLS_FDE_TRIAL %s attempt=%d float=%d kept=%d pass=%d alert=%d valid=%d expected=%d\n",
+             time_str(rtk->sol.time,3),attempt,asfloat,m,glsfdepassed(rtk),
+             rtk->intg.glsalert,rtk->intg.glsvalid,rtk->intg.glsexp);
+    return glsfdepassed(rtk);
+}
+
+/* Restore scalar diagnostics as well as the original estimator posterior, but
+ * retain current owned allocations: trials may have freed/reallocated scratch.
+ * Model scratch is no longer the original model and must not be reassessed. */
+static void glsfderollback(rtk_t *rtk,const rtk_t *full)
+{
+    rtkim_t live=rtk->intg;
+    glsfderestore(rtk,full);
+    rtk->intg=full->intg;
+    rtk->intg.bH=live.bH;rtk->intg.bR=live.bR;rtk->intg.bv=live.bv;
+    rtk->intg.slK=live.slK;rtk->intg.slQi=live.slQi;
+    rtk->intg.glsQ=live.glsQ;rtk->intg.glsF=live.glsF;
+    rtk->intg.glscandidates=live.glscandidates;
+    rtk->intg.glscapacity=live.glscapacity;
+    rtk->intg.glsready=0;
+    rtk->glsassessed=1;
+}
+
+static void glsfdeprocess(rtk_t *rtk,const rtk_t *prior,const obsd_t *obs,int n,
+                        const nav_t *nav,const sta_t *sta)
+{
+    rtk_t *full=glsfdesave(rtk);
+    rtkim_glscand_t *pool=NULL;
+    unsigned char mask[MAXSAT]={0};
+    int action=rtk->intg.fde.act,nc=0,i,k,attempts=0,passed=0;
+    if (!full) {
+        errmsg(rtk,"GLS FDE posterior allocation failed; retry disabled\n");
+        return;
+    }
+    if (action==RTKIM_A_FLOAT) {
+        passed=glsfdetrial(rtk,prior,obs,n,nav,sta,mask,1,action,++attempts);
+    } else {
+        nc=RTK_GLS_FDE_SEARCH?rtk->intg.glsncandidate:0;
+        if (nc>0) pool=(rtkim_glscand_t *)malloc(nc*sizeof(*pool));
+        if (pool) {
+            memcpy(pool,rtk->intg.glscandidates,nc*sizeof(*pool));
+            qsort(pool,nc,sizeof(*pool),glsfdecmp);
+        } else {
+            /* Memory pressure or legacy single-candidate mode: still verify. */
+            nc=1;
+            memcpy(mask,rtk->glsfdemask,sizeof(mask));
+        }
+        for (k=0;k<nc&&!passed;k++) {
+            if (pool) {
+                memset(mask,0,sizeof(mask));
+                for (i=0;i<pool[k].order;i++) mask[pool[k].sat[i]-1]=1;
+            }
+            passed=glsfdetrial(rtk,prior,obs,n,nav,sta,mask,0,action,++attempts);
+            if (!passed&&RTK_GLS_FDE_FLOAT_FIRST&&rtk->sol.stat==SOLQ_FIX&&
+                rtk->intg.glsvalid==rtk->intg.glsexp&&rtk->intg.glsfloatratio<=1.0&&
+                (rtk->intg.glsobsalert||rtk->intg.glsfixalert)) {
+                passed=glsfdetrial(rtk,prior,obs,n,nav,sta,mask,1,action,++attempts);
+            }
+        }
+    }
+    if (!passed&&RTK_GLS_FDE_TRANSACTIONAL) {
+        glsfderollback(rtk,full);
+        rtk->intfdeact=action;
+        rtk->intg.pl.hpl=rtk->intg.pl.vpl=INFINITY;
+        rtk->inthpl=rtk->intvpl=INFINITY;
+    }
+    rtk->intreproc=0;
+    rtkimdbg("GLS_FDE_RESULT %s attempts=%d accepted=%d rollback=%d action=%d\n",
+             time_str(rtk->sol.time,3),attempts,passed,
+             !passed&&RTK_GLS_FDE_TRANSACTIONAL,action);
+    free(pool);free(full->x);free(full);
+}
+#endif
+
 extern int rtkpos(rtk_t* rtk, const obsd_t* obs, int n, const nav_t* nav, const sta_t* stalin)
 {
 	prcopt_t* opt = &rtk->opt;
@@ -3729,6 +3861,9 @@ extern int rtkpos(rtk_t* rtk, const obsd_t* obs, int n, const nav_t* nav, const 
 	gtime_t time;
 	int i, nu, nr;
 	char msg[128] = "";
+#if defined(ENABLE_RTK_INTEGRITY) && RTK_INT_METHOD==RTK_INT_METHOD_GLS_SS
+    rtk_t *fde_prior=NULL;
+#endif
 
 	trace(3, "rtkpos  : time=%s n=%d\n", time_str(obs[0].time, 3), n);
 	trace(4, "obs=\n"); traceobs(4, obs, n);
@@ -3824,6 +3959,12 @@ extern int rtkpos(rtk_t* rtk, const obsd_t* obs, int n, const nav_t* nav, const 
 		}
 	}
 	/* relative potitioning */
+#if defined(ENABLE_RTK_INTEGRITY) && RTK_INT_METHOD==RTK_INT_METHOD_GLS_SS
+    if (!rtk->intchild&&rtk->intreproc<=0&&rtk->opt.intfde) {
+        fde_prior=glsfdesave(rtk);
+        if (!fde_prior) errmsg(rtk,"GLS FDE prior allocation failed; retry disabled\n");
+    }
+#endif
 	relpos(rtk, obs, nu, nr, nav);
 #if ENABLE_RTK_DEBUG_OUTPUT
     if (!rtk->intchild&&rtk->intreproc<=0) {
@@ -3837,10 +3978,22 @@ extern int rtkpos(rtk_t* rtk, const obsd_t* obs, int n, const nav_t* nav, const 
 #ifdef ENABLE_RTK_INTEGRITY
 	if (!rtk->intchild) {
 		rtkimdetect(rtk, obs, n, nav, stalin);
+#if RTK_INT_METHOD==RTK_INT_METHOD_GLS_SS
+        if ((RTK_GLS_FDE_TRANSACTIONAL||RTK_GLS_FDE_SEARCH)&&
+            rtk->intreproc<=0&&rtk->opt.intfde&&fde_prior&&
+            rtk->intg.fde.act!=RTKIM_A_NONE) {
+            glsfdeprocess(rtk,fde_prior,obs,n,nav,stalin);
+        } else
+#endif
 		if (rtk->intreproc<=0&&rtk->opt.intfde&&
-			rtk->intg.fde.act!=RTKIM_A_NONE) {
+			rtk->intg.fde.act!=RTKIM_A_NONE
+#if RTK_INT_METHOD==RTK_INT_METHOD_GLS_SS
+            &&fde_prior
+#endif
+            ) {
 			obsd_t obs_fde[MAXOBS*2];
 			prcopt_t opt_save=rtk->opt;
+            int original_modear=opt_save.modear;
 			int fde_pre_mode=rtk->intfdemode;
 			int fde_pre_sat=rtk->intfdesat;
 			int fde_mode=rtk->intg.fde.act;
@@ -3859,7 +4012,11 @@ extern int rtkpos(rtk_t* rtk, const obsd_t* obs, int n, const nav_t* nav, const 
                             stat0,ns0,ratio0,test0,rr0);
 #endif
 			for (i=0;i<n;i++) {
+#if RTK_INT_METHOD==RTK_INT_METHOD_GLS_SS
+                if (fde_mode==RTKIM_A_SAT&&rtk->glsfdemask[obs[i].sat-1]) continue;
+#else
 				if (fde_mode==RTKIM_A_SAT&&obs[i].sat==fde_sat) continue;
+#endif
 				obs_fde[m++]=obs[i];
 			}
 #if ENABLE_RTK_DEBUG_OUTPUT
@@ -3870,14 +4027,42 @@ extern int rtkpos(rtk_t* rtk, const obsd_t* obs, int n, const nav_t* nav, const 
                   time_str(rtk->sol.time,3),fde_mode,fde_sat,fde_pre_mode,fde_pre_sat,
                   stat0,ns0,ratio0,test0,
                   rr0[0],rr0[1],rr0[2],m,n);
+#if RTK_INT_METHOD==RTK_INT_METHOD_GLS_SS
+            /* Restore estimator history, retaining the live monitor allocations.
+             * Re-run only relative positioning: no second SPP or time advance. */
+            glsfderestore(rtk,fde_prior);
+            if (fde_mode==RTKIM_A_FLOAT) rtk->opt.modear=ARMODE_OFF;
+#else
 			if (fde_mode==RTKIM_A_FLOAT) opt_save.modear=ARMODE_OFF;
 			rtkfree(rtk);
 			rtkinit(rtk,&opt_save);
+#endif
 			rtk->intreproc=1;
 			rtk->intfdemode0=fde_pre_mode;
 			rtk->intfdesat0=fde_pre_sat;
 			rtk->intfdeact=fde_action;
-			rtkpos(rtk,obs_fde,m,nav,stalin);
+#if RTK_INT_METHOD==RTK_INT_METHOD_GLS_SS
+            {
+                int retry_nu=0,retry_nr=0;
+                for (;retry_nu<m&&obs_fde[retry_nu].rcv==1;retry_nu++);
+                for (;retry_nu+retry_nr<m&&obs_fde[retry_nu+retry_nr].rcv==2;retry_nr++);
+                rtkimdbg("GLS_FDE_PRIOR %s nx=%d na=%d tt=%.9g reset=0\n",
+                         time_str(rtk->sol.time,3),rtk->nx,rtk->na,rtk->tt);
+                if (retry_nu>0&&retry_nr>0) {
+                    relpos(rtk,obs_fde,retry_nu,retry_nr,nav);
+                } else {
+                    rtk->sol.stat=SOLQ_NONE;
+                    rtk->intg.glsready=0;
+                    rtk->glsassessed=0;
+                }
+                rtkimdetect(rtk,obs_fde,m,nav,stalin);
+                rtkimassess(rtk);
+            }
+            /* FLOAT recovery is local to this retry, not a permanent AR switch. */
+            rtk->opt.modear=original_modear;
+#else
+            rtkpos(rtk,obs_fde,m,nav,stalin);
+#endif
 #if ENABLE_RTK_DEBUG_OUTPUT
             rtkdbgepoch(rtk,"after",fde_action,fde_sat,m,n,
                             stat0,ns0,ratio0,test0,rr0);
@@ -3896,6 +4081,9 @@ extern int rtkpos(rtk_t* rtk, const obsd_t* obs, int n, const nav_t* nav, const 
 			rtkimassess(rtk);
 		}
 	}
+#endif
+#if defined(ENABLE_RTK_INTEGRITY) && RTK_INT_METHOD==RTK_INT_METHOD_GLS_SS
+    if (fde_prior) {free(fde_prior->x);free(fde_prior);}
 #endif
 	rtk->sol.rms_pr = (float)resrms(rtk, 0, NULL);
 	rtk->sol.rms_cp = (float)resrms(rtk, 1, NULL);

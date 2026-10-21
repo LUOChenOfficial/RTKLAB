@@ -771,7 +771,7 @@ static void runsub(rtk_t *rtk, int idx, const obsd_t *obs, int n,
 static void calcpl(rtk_t *rtk)
 {
 #if RTK_INT_METHOD==RTK_INT_METHOD_GLS_SS
-    rtkimglsassess(rtk);
+    if (!rtk->glsassessed) rtkimglsassess(rtk);
     return;
 #elif RTK_INT_METHOD==RTK_INT_METHOD_SLOPE
     rtkimslassess(rtk);
@@ -1020,6 +1020,7 @@ EXPORT void rtkimfree(rtk_t *rtk)
     rtk->intg.glsQ=NULL;
     free(rtk->intg.glsF);
     rtk->intg.glsF=NULL;
+    free(rtk->intg.glscandidates);
     memset(&rtk->intg,0,sizeof(rtk->intg));
 }
 
@@ -1123,7 +1124,14 @@ EXPORT void rtkimdetect(rtk_t *rtk, const obsd_t *obs, int nobs,
     mon->ep.ratio=rtk->sol.ratio;
     mon->ep.fixed=rtk->sol.stat==SOLQ_FIX;
     mon->ep.fixupd=mon->ep.fixed;
-#if RTK_INT_METHOD==RTK_INT_METHOD_SLOPE||RTK_INT_METHOD==RTK_INT_METHOD_GLS_SS
+#if RTK_INT_METHOD==RTK_INT_METHOD_GLS_SS
+    mon->ndef=mon->nact=0;
+    memset(&mon->fde,0,sizeof(mon->fde));
+    memset(&mon->act,0,sizeof(mon->act));
+    rtk->intfdemode=rtk->intfdesat=0;
+    if (rtk->opt.intfde) rtkimglsassess(rtk);
+    return;
+#elif RTK_INT_METHOD==RTK_INT_METHOD_SLOPE
     /* The slope method supplies PL only; it must not alter AR/FDE state. */
     mon->ndef=0;
     mon->nact=0;

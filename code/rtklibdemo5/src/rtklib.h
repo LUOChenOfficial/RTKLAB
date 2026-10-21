@@ -1000,6 +1000,9 @@ typedef struct {        /* solution type */
     double test_dd;       /*Ambiguity test statistic*/
     double Ftestvalue;    /*Reserved legacy field for F-test statistic*/
     double chi2testvalue; /*Posterior dd residual chi-square statistic*/
+    double post_varfactor; /*epoch augmented-GLS posterior variance scale*/
+    double post_vtpv;      /*real+prior residual quadratic, before scale*/
+    int post_dof;          /*augmented-GLS redundancy (measurement count)*/
     double MDBE[12];
     int    dof;            /*chi-square test degree of freedom*/
 	double dops[4];       /* DOP {GDOP,PDOP,HDOP,VDOP} */
@@ -1354,6 +1357,8 @@ typedef struct rtk_tag {        /* RTK control/result type */
     int intfdemode0; /* FDE mode before recovery reprocess */
     int intfdesat0;  /* FDE satellite before recovery reprocess */
     int intfdeact;   /* recovery action applied in this epoch */
+    unsigned char glsfdemask[MAXSAT]; /* tentative multi-satellite FDE candidate */
+    int glsassessed; /* current epoch GLS already assessed in detection */
     double inthpl,intvpl; /* last protection level */
 #endif
 
@@ -1983,6 +1988,13 @@ EXPORT void rtkdbgcounts(const rtk_t *rtk, const char *stage, int nobs, int nu,
                          int nr);
 EXPORT int rtkransac(const double *A, const double *v, const double *var,
                      int np, int nv, unsigned int seed, unsigned char *keep);
+EXPORT int rtkrobust(const double *x, const double *P, const double *v,
+                     const double *H, double *R, int nx, int nv, int maxiter,
+                     double tol, double relaxation, int *iterations,
+                     double *change);
+EXPORT void rtkdbgrobust(gtime_t time, int nv, int iterations, double change,
+                        int status, const char *reason);
+EXPORT void rtkdbgweight(gtime_t time,int row,int flag,double weight);
 EXPORT int rtkslopethres(int dof, double pfa, double pmd, double *thres,
                          double *lam);
 EXPORT void rtkimslprior(rtk_t *rtk, const double *x, const double *P,
@@ -1990,8 +2002,12 @@ EXPORT void rtkimslprior(rtk_t *rtk, const double *x, const double *P,
 EXPORT void rtkimglsprior(rtk_t *rtk, const double *x, const double *P,
                           const double *H, const double *R, int nx, int nv);
 EXPORT void rtkimglsassess(rtk_t *rtk);
+EXPORT int rtkglsvarscale(const double *S, const double *v, int nv,
+                          double *vtpv);
 EXPORT void rtkimglsout(gtime_t time, int mode, int sat1, int sat2,
                         const double *sep, const double *sigma);
+EXPORT int rtkglsddmask(const int *flags, int nv, const unsigned char *mask,
+                       int *rows, int *ixref);
 EXPORT int rtkglsddmat(const int *flags, int nv, int sat1, int sat2, int *rows,
                        int *ixref);
 EXPORT int rtkglsupdate(const double *Q, const double *F, const double *v,

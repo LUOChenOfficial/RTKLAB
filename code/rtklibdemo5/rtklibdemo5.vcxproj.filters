@@ -186,6 +186,9 @@
     <ClCompile Include="src\main.c">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="src\rtk_robust.c">
+      <Filter>源文件</Filter>
+    </ClCompile>
 </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\rtk_experiment_config.h">
